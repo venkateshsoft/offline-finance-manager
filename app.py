@@ -75,6 +75,13 @@ def local_conn():
         id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, lender TEXT,
         principal REAL, annual_rate REAL, emi REAL, start_date TEXT,
         tenure_months INTEGER, extra_payment REAL DEFAULT 0)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS income_sources(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, monthly_amount REAL,
+        start_date TEXT, end_date TEXT, annual_growth_pct REAL DEFAULT 0,
+        months_per_year INTEGER DEFAULT 12, active INTEGER DEFAULT 1)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS trading_results(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, trade_date TEXT, realized_pnl REAL,
+        notes TEXT)""")
     c.commit()
     return c
 
@@ -110,6 +117,21 @@ def db_delete_txn(txn_id):
         return get_supabase().table("transactions").delete().eq("id",txn_id).execute()
     c=local_conn()
     c.execute("DELETE FROM transactions WHERE id=?",(txn_id,))
+    c.commit()
+
+def db_delete(table, row_id):
+    if supabase_enabled():
+        return get_supabase().table(table).delete().eq("id",row_id).execute()
+    c=local_conn()
+    c.execute(f"DELETE FROM {table} WHERE id=?",(row_id,))
+    c.commit()
+
+def db_update(table, row_id, data):
+    if supabase_enabled():
+        return get_supabase().table(table).update(data).eq("id",row_id).execute().data
+    c=local_conn()
+    sets=",".join([f"{k}=?" for k in data])
+    c.execute(f"UPDATE {table} SET {sets} WHERE id=?",(*data.values(),row_id))
     c.commit()
 
 # ---------------- Classification ----------------
@@ -262,6 +284,34 @@ def get_loans():
     rows=db_select("loans")
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
+def get_income_sources():
+    rows=db_select("income_sources")
+    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["id","name","monthly_amount","start_date","end_date","annual_growth_pct","months_per_year","active"])
+
+def get_trading_results():
+    rows=db_select("trading_results")
+    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["id","trade_date","realized_pnl","notes"])
+
+def projected_income_for_month(sources, month_start):
+    if sources is None or sources.empty:
+        return 0.0
+    month_start=pd.Timestamp(month_start).date().replace(day=1)
+    total=0.0
+    for _,r in sources.iterrows():
+        if not bool(r.get("active",1)): continue
+        start=pd.to_datetime(r["start_date"],errors="coerce")
+        if pd.isna(start) or start.date().replace(day=1)>month_start: continue
+        end=pd.to_datetime(r.get("end_date"),errors="coerce") if r.get("end_date") else pd.NaT
+        if pd.notna(end) and end.date().replace(day=1)<month_start: continue
+        mpy=int(r.get("months_per_year",12) or 12)
+        # For annual/monthly rental-like income, months_per_year=12 means every month.
+        # If fewer months are selected, receive in the first mpy calendar months of each year.
+        if mpy<12 and month_start.month>mpy: continue
+        years=max(0,month_start.year-start.year)
+        amount=float(r.get("monthly_amount",0) or 0)*((1+float(r.get("annual_growth_pct",0) or 0)/100)**years)
+        total+=amount
+    return total
+
 # ---------------- App ----------------
 st.sidebar.title("💰 Finance Manager")
 st.sidebar.caption("Secure personal finance workspace")
@@ -393,28 +443,121 @@ with tabs[4]:
 # Runway
 with tabs[5]:
     st.subheader("🛟 Financial Runway / Income-Gap Planner")
+    st.caption("Model your runway using current cash, mandatory spending, rental/other recurring income, and realized or planned swing-trading P/L.")
+
+    # --- Income generators ---
+    st.markdown("### 💰 Income generators")
+    st.caption("Add income you reasonably expect during the job-search period. Rental income can be modeled separately from salary.")
+    with st.form("income_source_form"):
+        a,b,c,d=st.columns(4)
+        inc_name=a.text_input("Income source", "Flat Rent")
+        inc_amount=b.number_input("Monthly net income (₹)",min_value=0.0,value=45000.0,step=1000.0)
+        inc_start=c.date_input("Starts from",date.today().replace(day=1))
+        inc_growth=d.number_input("Annual increase %",min_value=0.0,max_value=50.0,value=0.0,step=1.0)
+        e,f,g=st.columns(3)
+        inc_end=e.date_input("Ends on (optional)",date(2099,12,31))
+        inc_months=f.number_input("Months received per year",min_value=1,max_value=12,value=12,step=1)
+        inc_active=g.checkbox("Active",value=True)
+        add_inc=st.form_submit_button("Add income source",type="primary")
+    if add_inc:
+        db_insert("income_sources",{"name":inc_name,"monthly_amount":float(inc_amount),"start_date":str(inc_start),
+                                     "end_date":None if inc_end.year>=2099 else str(inc_end),
+                                     "annual_growth_pct":float(inc_growth),"months_per_year":int(inc_months),"active":bool(inc_active)})
+        st.success(f"Added {inc_name} at ₹{inc_amount:,.0f}/month.")
+        st.rerun()
+
+    sources=get_income_sources()
+    if not sources.empty:
+        st.dataframe(sources[["id","name","monthly_amount","start_date","end_date","annual_growth_pct","months_per_year","active"]],use_container_width=True,hide_index=True)
+        sid=st.selectbox("Income source to remove",sources.id.tolist(),format_func=lambda x:sources.loc[sources.id==x,"name"].iloc[0])
+        if st.button("Remove selected income source"):
+            db_delete("income_sources",int(sid)); st.rerun()
+
+    # --- Trading P/L ---
+    st.markdown("### 📈 Swing-trading P/L")
+    st.caption("Record only realized profit/loss. Do not treat trading as guaranteed salary. Future trading P/L is a planning assumption unless you enter actual results.")
+    with st.form("trading_form"):
+        a,b,c=st.columns(3)
+        trade_date=a.date_input("Trade/realization date",date.today())
+        pnl=b.number_input("Realized P/L (₹)",value=0.0,step=1000.0,help="Profit is positive; loss is negative.")
+        notes=c.text_input("Notes", "Swing trade")
+        add_trade=st.form_submit_button("Add trading result")
+    if add_trade:
+        db_insert("trading_results",{"trade_date":str(trade_date),"realized_pnl":float(pnl),"notes":notes})
+        st.success("Trading P/L recorded.")
+        st.rerun()
+
+    trades=get_trading_results()
+    realized_avg=0.0
+    if not trades.empty:
+        trades["trade_date"]=pd.to_datetime(trades.trade_date)
+        monthly_pnl=trades.assign(month=trades.trade_date.dt.to_period("M").astype(str)).groupby("month").realized_pnl.sum()
+        realized_avg=float(monthly_pnl.tail(3).mean()) if not monthly_pnl.empty else 0.0
+        st.dataframe(trades.sort_values("trade_date",ascending=False),use_container_width=True,hide_index=True)
+        tid=st.selectbox("Trading result to remove",trades.id.tolist(),format_func=lambda x:f"{trades.loc[trades.id==x,'trade_date'].iloc[0].date()} | ₹{trades.loc[trades.id==x,'realized_pnl'].iloc[0]:,.0f}")
+        if st.button("Remove selected trading result"):
+            db_delete("trading_results",int(tid)); st.rerun()
+
+    # --- Runway assumptions ---
+    st.markdown("### 🧮 Runway assumptions")
     df=get_txns(); ms=monthly_series(df)
     hist=float(ms.debit.tail(6).mean()) if not ms.empty else 0
     emi_hist=float(df[(df.direction=="Debit")&(df["class"]=="EMI")].groupby(df.txn_date.str[:7]).amount.sum().tail(6).mean()) if not df.empty else 0
-    a,b,c=st.columns(3)
-    liquid=a.number_input("Current liquid funds",min_value=0.0,value=0.0,step=10000.0)
-    essential=b.number_input("Monthly essential burn (excluding EMI)",min_value=0.0,value=max(0.0,hist-emi_hist),step=5000.0)
-    emi_m=c.number_input("Monthly EMI commitment",min_value=0.0,value=max(0.0,emi_hist),step=5000.0)
-    reduction=st.slider("Discretionary-spending reduction",0,100,30)
-    gap=st.number_input("Expected no-income period (months)",min_value=0,max_value=60,value=6)
-    burn=essential*(1-reduction/100)+emi_m
-    runway=liquid/burn if burn else float("inf")
-    st.metric("Estimated runway","Unlimited" if not math.isfinite(runway) else f"{runway:.1f} months")
-    rows=[]
-    for m in [3,6,9,12]:
-        need=burn*m
-        rows.append([m,need,liquid-need,"Covered" if liquid>=need else "Shortfall"])
-    st.dataframe(pd.DataFrame(rows,columns=["Months","Cash needed","Funds remaining","Status"]),hide_index=True)
+    a,b,c,d=st.columns(4)
+    liquid=a.number_input("Current liquid funds (₹)",min_value=0.0,value=0.0,step=10000.0)
+    essential=b.number_input("Monthly essential burn excluding EMI (₹)",min_value=0.0,value=max(0.0,hist-emi_hist),step=5000.0)
+    emi_m=c.number_input("Monthly EMI commitment (₹)",min_value=0.0,value=max(0.0,emi_hist),step=5000.0)
+    reduction=d.slider("Discretionary-spending reduction",0,100,35)
+    e,f=st.columns(2)
+    gap=e.number_input("Expected no-salary period (months)",min_value=0,max_value=60,value=6)
+    planned_trade=f.number_input("Planned monthly trading P/L (₹)",value=0.0,step=1000.0,help="Use 0 for a conservative case. Positive numbers are expected profit; negative numbers are expected loss.")
+
+    st.markdown("### 📊 Runway scenarios")
+    base_burn=max(0.0,essential*(1-reduction/100)+emi_m)
+    today_month=pd.Timestamp(date.today().replace(day=1))
+    rent_income=projected_income_for_month(sources,today_month)
+    monthly_trade_assumption=float(planned_trade)
+    # Current/realized trading history is shown separately; planned future P/L is not silently inferred from past results.
+    monthly_rows=[]
+    cash=liquid
+    months_to_show=max(12,int(gap) if gap else 12)
+    for i in range(months_to_show):
+        m=today_month+pd.DateOffset(months=i)
+        income=projected_income_for_month(sources,m)
+        net=base_burn-income-monthly_trade_assumption
+        cash-=net
+        monthly_rows.append([m.strftime("%b %Y"),income,monthly_trade_assumption,base_burn,net,cash])
+    forecast=pd.DataFrame(monthly_rows,columns=["Month","Recurring income","Trading P/L assumption","Monthly burn","Net cash change","Ending cash"])
+
+    # Three transparent scenarios: no income, rent only, rent + trading assumption.
+    rent_monthly=float(rent_income)
+    current_runway=liquid/base_burn if base_burn else float("inf")
+    rent_net=max(0.0,base_burn-rent_monthly)
+    rent_runway=liquid/rent_net if rent_net else float("inf")
+    combined_net=max(0.0,base_burn-rent_monthly-monthly_trade_assumption)
+    combined_runway=liquid/combined_net if combined_net else float("inf")
+    c1,c2,c3=st.columns(3)
+    c1.metric("Runway without new income", "Unlimited" if not math.isfinite(current_runway) else f"{current_runway:.1f} months")
+    c2.metric("Runway with recurring income", "Unlimited" if not math.isfinite(rent_runway) else f"{rent_runway:.1f} months")
+    c3.metric("Runway with income + trading", "Unlimited" if not math.isfinite(combined_runway) else f"{combined_runway:.1f} months")
+
+    if not sources.empty:
+        st.info(f"Recurring income currently modeled: ₹{rent_monthly:,.0f}/month from active income sources starting this month.")
+    if not trades.empty:
+        st.caption(f"Realized trading P/L entered so far: ₹{trades.realized_pnl.sum():,.0f}. Recent monthly average: ₹{realized_avg:,.0f}. Future runway uses your explicit planned P/L assumption of ₹{planned_trade:,.0f}/month, not the historical average.")
+
+    st.subheader("Month-by-month forecast")
+    st.dataframe(forecast,use_container_width=True,hide_index=True)
+    st.line_chart(forecast.set_index("Month")["Ending cash"])
+
     if gap:
-        need=burn*gap
-        if liquid>=need: st.success(f"{gap}-month scenario: approximately ₹{liquid-need:,.0f} remains.")
-        else: st.error(f"{gap}-month scenario: estimated shortfall ₹{need-liquid:,.0f}.")
-    st.caption("Runway is an estimate from your inputs/history and should be reviewed as income, spending and loan terms change.")
+        end_row=forecast.iloc[min(int(gap)-1,len(forecast)-1)]
+        if float(end_row["Ending cash"])>=0:
+            st.success(f"{gap}-month scenario: projected ending cash is approximately ₹{float(end_row['Ending cash']):,.0f} using the income and trading assumptions above.")
+        else:
+            st.error(f"{gap}-month scenario: projected shortfall is approximately ₹{abs(float(end_row['Ending cash'])):,.0f} using the income and trading assumptions above.")
+    st.warning("Trading income is inherently uncertain. For a conservative runway, set Planned monthly trading P/L to ₹0 or a negative stress value; use realized P/L entries to track actual performance.")
+    st.caption("Runway is a planning model, not a guarantee. Review rent, vacancy, taxes, maintenance, spending and trading assumptions as circumstances change.")
 
 # Transactions
 with tabs[6]:

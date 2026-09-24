@@ -154,6 +154,9 @@ def reset_all_financial_data():
     """
     if supabase_enabled():
         for table in RESETTABLE_TABLES:
+            # The recurring_exclusions table is optional until its migration is applied.
+            if table == "recurring_exclusions" and not recurring_exclusions_available():
+                continue
             # All application IDs are positive serial/identity values.
             get_supabase().table(table).delete().neq("id", 0).execute()
         return
@@ -164,14 +167,39 @@ def reset_all_financial_data():
     c.commit()
 
 # ---------------- Recurring-payment exclusions ----------------
+def recurring_exclusions_available():
+    """Return True when the optional recurring_exclusions table is available.
+
+    The feature is optional until the Supabase migration is applied. A missing
+    table must never prevent the rest of the Finance Manager from loading.
+    """
+    if not supabase_enabled():
+        return True
+    try:
+        get_supabase().table("recurring_exclusions").select("id").limit(1).execute()
+        return True
+    except Exception:
+        return False
+
 def get_recurring_exclusions():
-    rows=db_select("recurring_exclusions")
-    return {str(r.get("recurring_key")) for r in rows if r.get("recurring_key")}
+    if not recurring_exclusions_available():
+        return set()
+    try:
+        rows=db_select("recurring_exclusions")
+        return {str(r.get("recurring_key")) for r in rows if r.get("recurring_key")}
+    except Exception:
+        return set()
 
 def recurring_key(merchant_key, frequency, amount):
     return f"{str(merchant_key).strip().upper()}|{str(frequency).strip()}|{round(float(amount or 0))}"
 
 def exclude_recurring(rec_key):
+    if not recurring_exclusions_available():
+        raise RuntimeError(
+            "Recurring-payment exclusions are not enabled yet. Run the supplied "
+            "supabase_recurring_exclusions_migration.sql once in Supabase SQL Editor, "
+            "then reboot the Streamlit app."
+        )
     payload={"recurring_key":str(rec_key),"created_at":datetime.now().isoformat()}
     if supabase_enabled():
         # Avoid a duplicate-key error if the user clicks delete twice.
@@ -186,6 +214,8 @@ def exclude_recurring(rec_key):
         c.commit()
 
 def restore_recurring(rec_id):
+    if not recurring_exclusions_available():
+        raise RuntimeError("Recurring-payment exclusions table is not available. Run the Supabase migration first.")
     db_delete("recurring_exclusions",int(rec_id))
 
 def is_emi_transaction(row):
@@ -951,12 +981,15 @@ with tabs[3]:
             st.rerun()
 
     # Show excluded patterns so the user can restore a mistakenly removed EMI.
-    if supabase_enabled():
-        excluded_rows=db_select("recurring_exclusions")
-        excluded_df=pd.DataFrame(excluded_rows) if excluded_rows else pd.DataFrame()
-    else:
-        excluded_rows=db_select("recurring_exclusions")
-        excluded_df=pd.DataFrame(excluded_rows) if excluded_rows else pd.DataFrame()
+    excluded_df=pd.DataFrame()
+    if recurring_exclusions_available():
+        try:
+            excluded_rows=db_select("recurring_exclusions")
+            excluded_df=pd.DataFrame(excluded_rows) if excluded_rows else pd.DataFrame()
+        except Exception:
+            excluded_df=pd.DataFrame()
+    elif supabase_enabled():
+        st.info("Recurring-payment removal is ready, but the Supabase migration has not been applied yet. Run the supplied `supabase_recurring_exclusions_migration.sql` once in Supabase SQL Editor.")
     if not excluded_df.empty:
         with st.expander("↩️ Restore removed recurring payments"):
             exid=st.selectbox("Removed recurring pattern",excluded_df.id.tolist(),

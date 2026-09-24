@@ -135,6 +135,31 @@ def db_update(table, row_id, data):
     c.execute(f"UPDATE {table} SET {sets} WHERE id=?",(*data.values(),row_id))
     c.commit()
 
+# ---------------- Safe data reset ----------------
+RESETTABLE_TABLES = [
+    "transactions",
+    "rules",
+    "loans",
+    "income_sources",
+    "trading_results",
+]
+
+def reset_all_financial_data():
+    """Delete user-entered/test financial data from every storage backend.
+
+    Authentication/secrets and application code are not affected.
+    """
+    if supabase_enabled():
+        for table in RESETTABLE_TABLES:
+            # All application IDs are positive serial/identity values.
+            get_supabase().table(table).delete().neq("id", 0).execute()
+        return
+
+    c=local_conn()
+    for table in RESETTABLE_TABLES:
+        c.execute(f"DELETE FROM {table}")
+    c.commit()
+
 # ---------------- Classification ----------------
 BUILTIN = [
 ("swiggy","Food","Expense"),("zomato","Food","Expense"),("dominos","Food","Expense"),
@@ -785,3 +810,15 @@ with tabs[7]:
     st.write("- Do not put passwords, API keys, bank statements or database files in GitHub.")
     st.write("### Backup")
     st.write("For a serious personal-finance deployment, keep periodic encrypted exports/backups outside the Git repository.")
+
+    st.write("### 🧹 Data reset")
+    st.caption("Use this once to remove the sample/test data you entered while building the app. It does not change your login password, Streamlit Secrets, GitHub files, or application code.")
+    st.warning("⚠️ This will permanently delete ALL saved transactions, learning rules, loans, income sources, and trading P/L from the connected database. This cannot be undone.")
+    confirm_reset = st.checkbox("I understand that this will permanently delete my saved financial data.", key="confirm_full_reset")
+    if st.button("🧹 Reset all sample/test financial data", type="secondary", disabled=not confirm_reset):
+        try:
+            reset_all_financial_data()
+            st.success("All sample/test financial data has been cleared. You can now import your real bank data.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Reset encountered an error: {e}. Please verify the data before trying again, because a cloud reset can be partially completed if one table rejects the delete.")

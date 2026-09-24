@@ -83,8 +83,6 @@ def local_conn():
     c.execute("""CREATE TABLE IF NOT EXISTS trading_results(
         id INTEGER PRIMARY KEY AUTOINCREMENT, trade_date TEXT, realized_pnl REAL,
         notes TEXT)""")
-    c.execute("""CREATE TABLE IF NOT EXISTS recurring_exclusions(
-        id INTEGER PRIMARY KEY AUTOINCREMENT, recurring_key TEXT UNIQUE, created_at TEXT)""")
     c.commit()
     return c
 
@@ -144,7 +142,6 @@ RESETTABLE_TABLES = [
     "loans",
     "income_sources",
     "trading_results",
-    "recurring_exclusions",
 ]
 
 def reset_all_financial_data():
@@ -154,9 +151,6 @@ def reset_all_financial_data():
     """
     if supabase_enabled():
         for table in RESETTABLE_TABLES:
-            # The recurring_exclusions table is optional until its migration is applied.
-            if table == "recurring_exclusions" and not recurring_exclusions_available():
-                continue
             # All application IDs are positive serial/identity values.
             get_supabase().table(table).delete().neq("id", 0).execute()
         return
@@ -165,127 +159,6 @@ def reset_all_financial_data():
     for table in RESETTABLE_TABLES:
         c.execute(f"DELETE FROM {table}")
     c.commit()
-
-# ---------------- Recurring-payment exclusions ----------------
-def _fallback_exclusions():
-    """Session-only fallback used when the optional Supabase table is not available.
-
-    This keeps the app functional before the one-time migration is applied.
-    Once the migration exists, exclusions are persisted in Supabase.
-    """
-    return st.session_state.setdefault("recurring_exclusions_fallback", {})
-
-@st.cache_data(ttl=60, show_spinner=False)
-def _supabase_recurring_exclusions_available():
-    try:
-        get_supabase().table("recurring_exclusions").select("id").limit(1).execute()
-        return True
-    except Exception:
-        return False
-
-def recurring_exclusions_available():
-    """Return whether persistent recurring exclusions are available.
-
-    A missing optional table must never crash the application.
-    """
-    if not supabase_enabled():
-        return True
-    return bool(_supabase_recurring_exclusions_available())
-
-def get_recurring_exclusions():
-    fallback=set(_fallback_exclusions().keys())
-    if not supabase_enabled():
-        return fallback
-    if not recurring_exclusions_available():
-        return fallback
-    try:
-        rows=db_select("recurring_exclusions")
-        return fallback | {str(r.get("recurring_key")) for r in rows if r.get("recurring_key")}
-    except Exception:
-        return fallback
-
-def recurring_key(merchant_key, frequency, amount):
-    return f"{str(merchant_key).strip().upper()}|{str(frequency).strip()}|{round(float(amount or 0))}"
-
-def exclude_recurring(rec_key):
-    """Exclude a recurring pattern without ever crashing the app.
-
-    If the Supabase migration is not present, the exclusion is applied to the
-    current Streamlit session and a non-fatal status is returned. If the table
-    exists, the exclusion is persisted and also mirrored in session state.
-    """
-    rec_key=str(rec_key)
-    fallback=_fallback_exclusions()
-    fallback[rec_key]={"recurring_key":rec_key,"created_at":datetime.now().isoformat()}
-
-    if not supabase_enabled():
-        c=local_conn()
-        c.execute("INSERT OR IGNORE INTO recurring_exclusions (recurring_key,created_at) VALUES (?,?)",
-                  (rec_key,datetime.now().isoformat()))
-        c.commit()
-        return True, "saved locally"
-
-    if not recurring_exclusions_available():
-        return False, "session only"
-
-    try:
-        existing=(get_supabase().table("recurring_exclusions").select("id")
-                  .eq("recurring_key",rec_key).limit(1).execute().data)
-        if not existing:
-            get_supabase().table("recurring_exclusions").insert({
-                "recurring_key":rec_key,
-                "created_at":datetime.now().isoformat()
-            }).execute()
-        return True, "saved"
-    except Exception:
-        # Preserve the session exclusion even if the optional table becomes
-        # temporarily unavailable. The rest of the app remains usable.
-        return False, "session only"
-
-def restore_recurring(rec_id=None, rec_key_value=None):
-    """Restore an excluded recurring pattern safely."""
-    if rec_key_value:
-        _fallback_exclusions().pop(str(rec_key_value),None)
-    if not supabase_enabled():
-        if rec_id is not None:
-            db_delete("recurring_exclusions",int(rec_id))
-        return True
-    # If the migration is missing, the session fallback has already been
-    # removed above, so restoring is still successful for this session.
-    if not recurring_exclusions_available():
-        return True
-    try:
-        if rec_id is not None:
-            db_delete("recurring_exclusions",int(rec_id))
-        elif rec_key_value:
-            get_supabase().table("recurring_exclusions").delete().eq("recurring_key",str(rec_key_value)).execute()
-        return True
-    except Exception:
-        return False
-
-def is_emi_transaction(row):
-    cls=str(row.get("class","")).upper()
-    cat=str(row.get("category","")).lower()
-    desc=str(row.get("description","")).lower()
-    if cls=="EMI" or cat=="loan emi":
-        return True
-    emi_terms=("loan emi","home loan","housing finance","housingfin","pnbhousing",
-               "hdfc home","mortgage","emi")
-    return any(term in desc for term in emi_terms)
-
-def recurring_emi_total(df):
-    """Return the active monthly EMI commitment used by Runway.
-
-    Only rows explicitly classified as EMI and detected as Monthly are included.
-    A quarterly/annual recurring payment is not silently converted into an EMI.
-    """
-    rec=recurring(df)
-    if rec.empty or "Type" not in rec.columns:
-        return 0.0
-    emi=rec[(rec["Type"]=="EMI") & (rec["Frequency"]=="Monthly")]
-    if emi.empty:
-        return 0.0
-    return float(emi["Typical Amount"].sum())
 
 # ---------------- Classification ----------------
 BUILTIN = [
@@ -309,7 +182,41 @@ BUILTIN = [
 ("salary","Salary","Income"),("payroll","Salary","Income"),("credit salary","Salary","Income")
 ]
 CATEGORIES = ["Food","Travel","Entertainment","Fuel","Online Shopping","Education","Medical",
-              "Insurance","Utilities","Loan EMI","Cash Withdrawal","Transfer","Other"]
+              "Insurance","Utilities","Loan EMI","Cash Withdrawal","Transfer","Investment","Other"]
+
+CUSTOM_CATEGORY_OPTION = "➕ Add custom category..."
+
+def get_category_options(df=None):
+    """Return built-in plus user-created categories without requiring a schema migration.
+
+    Custom categories are persisted through the existing learning rules table and
+    existing transaction data, so this enhancement remains backward-compatible
+    with the current database.
+    """
+    options = list(CATEGORIES)
+    try:
+        for _, cat, _ in load_rules():
+            cat = str(cat or "").strip()
+            if cat and cat not in options:
+                options.append(cat)
+    except Exception:
+        pass
+    if df is not None and not df.empty and "category" in df.columns:
+        for cat in df["category"].dropna().astype(str).tolist():
+            cat = cat.strip()
+            if cat and cat not in options:
+                options.append(cat)
+    return options
+
+def resolve_category(selection, custom_value=""):
+    if selection == CUSTOM_CATEGORY_OPTION:
+        value = str(custom_value or "").strip()
+        if not value:
+            raise ValueError("Please enter a custom category name.")
+        if len(value) > 60:
+            raise ValueError("Custom category must be 60 characters or fewer.")
+        return value
+    return str(selection).strip()
 
 def load_rules():
     rows=db_select("rules")
@@ -352,6 +259,49 @@ def _merchant_signature(description):
 def suggest_rule_pattern(description):
     """Suggest a useful learning pattern instead of the first generic token (e.g. ACH)."""
     return _merchant_signature(description)[:50]
+
+def apply_learning_to_similar_transactions(pattern, category, class_name, selected_txn_id=None):
+    """Apply a learning correction to all matching transactions.
+
+    Uses one Supabase update for matching descriptions and a single local SQLite
+    transaction for the fallback backend. The selected transaction is always
+    included even when its description does not contain the exact pattern.
+    """
+    pattern = str(pattern or "").strip()
+    if not pattern:
+        raise ValueError("Please enter a merchant pattern before saving the correction.")
+
+    if supabase_enabled():
+        total = 0
+        # Update transactions whose narration contains the learned pattern.
+        try:
+            result = (get_supabase().table("transactions")
+                      .update({"category": category, "class": class_name})
+                      .ilike("description", f"%{pattern}%")
+                      .execute())
+            total += len(result.data or [])
+        except Exception:
+            # Fall back to exact selected transaction so learning never loses the
+            # correction because a broad update is rejected by the backend.
+            pass
+        if selected_txn_id is not None:
+            db_update_txn(int(selected_txn_id), {"category": category, "class": class_name})
+            if total == 0:
+                total = 1
+        return total
+
+    c = local_conn()
+    rows = c.execute("SELECT id, description FROM transactions").fetchall()
+    pattern_lower = pattern.lower()
+    matched_ids = [int(row[0]) for row in rows if pattern_lower in str(row[1] or "").lower()]
+    if selected_txn_id is not None and int(selected_txn_id) not in matched_ids:
+        matched_ids.append(int(selected_txn_id))
+    if matched_ids:
+        placeholders = ",".join(["?"] * len(matched_ids))
+        c.execute(f"UPDATE transactions SET category=?, class=? WHERE id IN ({placeholders})",
+                  (category, class_name, *matched_ids))
+        c.commit()
+    return len(matched_ids)
 
 def save_rule(pattern, category, class_name):
     """Insert a learning rule or update the existing rule with the same pattern."""
@@ -407,60 +357,6 @@ def save_rule(pattern, category, class_name):
     )
     c.commit()
     return "updated" if existing else "created"
-
-def apply_learning_rule(pattern, category, class_name, source_description=None):
-    """Apply a learning correction to all similar historical transactions.
-
-    Matching uses both the user-entered pattern and, when available, the stable
-    merchant signature of the selected transaction. This is important for bank
-    narrations such as ACH/NACH/loan references where the account or reference
-    number changes every month. The saved rule also classifies future imports.
-    """
-    pattern=str(pattern or "").strip()
-    target_sig=_merchant_signature(source_description) if source_description else ""
-    if not pattern and not target_sig:
-        return 0
-
-    if supabase_enabled():
-        # Supabase/PostgREST cannot safely express our Python merchant-signature
-        # normalization in one SQL predicate, so fetch only the lightweight
-        # transaction fields needed for matching and update matching IDs in
-        # batches. This avoids one request per transaction.
-        rows=(get_supabase().table("transactions")
-              .select("id,description")
-              .execute().data or [])
-        ids=[]
-        p=pattern.lower()
-        for row in rows:
-            desc=str(row.get("description", ""))
-            sig=_merchant_signature(desc)
-            if (target_sig and sig==target_sig) or (p and p in desc.lower()):
-                ids.append(int(row["id"]))
-        updated=0
-        for start in range(0,len(ids),500):
-            batch=ids[start:start+500]
-            if not batch:
-                continue
-            response=(get_supabase().table("transactions")
-                      .update({"category":category,"class":class_name})
-                      .in_("id",batch).execute())
-            updated += len(getattr(response,"data",[]) or [])
-        return updated
-
-    c=local_conn()
-    rows=c.execute("SELECT id,description FROM transactions").fetchall()
-    p=pattern.lower()
-    ids=[]
-    for row_id,desc in rows:
-        desc=str(desc or "")
-        sig=_merchant_signature(desc)
-        if (target_sig and sig==target_sig) or (p and p in desc.lower()):
-            ids.append(int(row_id))
-    if ids:
-        c.executemany("UPDATE transactions SET category=?, class=? WHERE id=?",
-                      [(category,class_name,row_id) for row_id in ids])
-        c.commit()
-    return len(ids)
 
 def fingerprint(d, desc, amt, direction):
     raw=f"{d}|{str(desc).strip().lower()}|{round(float(amt),2)}|{direction}"
@@ -801,77 +697,73 @@ def amortize(principal,annual,months,start,emi=None,extra=0):
     return pd.DataFrame(rows,columns=["Installment","Due Date","Payment","Interest","Principal","Balance"])
 
 def recurring(df):
-    """Detect recurring payments, with special handling for loan EMIs.
+    """Detect recurring payments even when bank narration contains changing IDs.
 
-    EMI transactions are treated as recurring commitments even when only one
-    historical occurrence exists. This makes a newly imported HDFC/PNB EMI
-    visible immediately; the user can remove any non-mandatory item from the
-    recurring list. When two or more occurrences exist, the interval is used to
-    confirm Monthly/Quarterly/Annual/Fortnightly frequency.
+    EMI transactions receive special handling: the app can identify a monthly
+    commitment from the EMI class/category and repeated amount/date pattern even
+    when the narration changes from month to month (common with ACH/NACH debits).
     """
     if df.empty:
         return pd.DataFrame()
+
     d=df[df.direction=="Debit"].copy()
     if d.empty:
         return pd.DataFrame()
     d["date"]=pd.to_datetime(d.txn_date,errors="coerce")
     d=d.dropna(subset=["date"])
     d["merchant_key"]=d.description.map(_merchant_signature)
-    d["is_emi"]=d.apply(is_emi_transaction,axis=1)
-    exclusions=get_recurring_exclusions()
+    d["is_emi"]=((d["class"].astype(str).str.upper()=="EMI") |
+                  (d["category"].astype(str).str.lower()=="loan emi"))
+
     rows=[]
 
-    def detect_frequency(g, is_emi=False):
-        g=g.sort_values("date")
-        if len(g)<2:
-            return "Monthly" if is_emi else None
-        diffs=g.date.diff().dt.days.dropna()
-        if diffs.empty:
-            return "Monthly" if is_emi else None
-        med=float(diffs.median())
-        if 20<=med<=45: return "Monthly"
-        if 75<=med<=110: return "Quarterly"
-        if 330<=med<=400: return "Annual"
-        if 12<=med<=17: return "Fortnightly"
-        # EMI schedules can occasionally be affected by weekends/holidays.
-        if is_emi and 45<med<75: return "Monthly"
-        return None
-
-    def add_group(key,g,frequency,is_emi):
-        if g.empty or not frequency:
+    def add_group(label,g,frequency):
+        if g.empty:
             return
-        typical=float(g.amount.median())
-        rec_key=recurring_key(key,frequency,typical)
-        if rec_key in exclusions:
-            return
-        rows.append([key or ("Loan EMI" if is_emi else "Recurring payment"),
-                     frequency,typical,len(g),g.date.max().date(),
-                     "EMI" if is_emi else "Recurring payment",rec_key])
+        rows.append([label,frequency,float(g.amount.median()),len(g),g.date.max().date(),
+                     "EMI" if bool(g.is_emi.any()) else "Recurring payment"])
 
-    # EMI groups: merchant signature + approximately fixed amount.
-    # We use a rounded amount bucket to avoid floating-point differences while
-    # still separating multiple loans from the same lender.
+    # 1) EMI groups: group by stable merchant signature + rounded amount.
+    # This handles narrations such as ACH/PNBHOUSINGFIN-<changing-id>.
     emi=d[d.is_emi].copy()
     if not emi.empty:
         emi["amount_key"]=emi.amount.round(0)
         for (key,amount),g in emi.groupby(["merchant_key","amount_key"]):
-            freq=detect_frequency(g,True)
-            if freq:
-                add_group(key,g,freq,True)
+            g=g.sort_values("date")
+            diffs=g.date.diff().dt.days.dropna()
+            if len(g)>=2 and len(diffs):
+                med=float(diffs.median())
+                if 25<=med<=35:
+                    add_group(key or "Loan EMI",g,"Monthly")
+                elif 80<=med<=100:
+                    add_group(key or "Loan EMI",g,"Quarterly")
+                elif 350<=med<=380:
+                    add_group(key or "Loan EMI",g,"Annual")
 
-    # Other recurring payments need at least two historical occurrences.
+    # 2) Other recurring payments: stable signature + similar amount.
     non_emi=d[~d.is_emi].copy()
     if not non_emi.empty:
         non_emi["amount_key"]=non_emi.amount.round(0)
         for (key,amount),g in non_emi.groupby(["merchant_key","amount_key"]):
+            g=g.sort_values("date")
             if len(g)<2:
                 continue
-            freq=detect_frequency(g,False)
-            if freq:
-                add_group(key,g,freq,False)
+            diffs=g.date.diff().dt.days.dropna()
+            if not len(diffs):
+                continue
+            med=float(diffs.median())
+            if 25<=med<=35: freq="Monthly"
+            elif 80<=med<=100: freq="Quarterly"
+            elif 350<=med<=380: freq="Annual"
+            elif 12<=med<=17: freq="Fortnightly"
+            else: continue
+            # Require either 3 occurrences or 2 occurrences with a convincing
+            # interval. This avoids classifying unrelated one-off payments.
+            if len(g)>=2:
+                add_group(key or "Recurring payment",g,freq)
 
     result=pd.DataFrame(rows,columns=["Merchant / Description","Frequency","Typical Amount",
-                                      "Occurrences","Last Seen","Type","_recurring_key"])
+                                      "Occurrences","Last Seen","Type"])
     if result.empty:
         return result
     return result.sort_values(["Type","Last Seen"],ascending=[True,False]).reset_index(drop=True)
@@ -975,26 +867,33 @@ with tabs[1]:
 # Learning
 with tabs[2]:
     st.subheader("🧠 Merchant/category learning")
-    st.caption("Correct one transaction and the same merchant pattern will be applied to matching historical transactions and future imports.")
+    st.caption("Corrections become local rules. Example: AMZN → Online Shopping, a lender name → Loan EMI.")
     df=get_txns()
     if not df.empty:
         idx=st.selectbox("Transaction",df.index,format_func=lambda i:f"{df.loc[i,'txn_date']} | {df.loc[i,'description']} | ₹{df.loc[i,'amount']:,.2f} | {df.loc[i,'category']}")
         r=df.loc[idx]
         c1,c2,c3=st.columns(3)
-        cat=c1.selectbox("Correct category",CATEGORIES,index=CATEGORIES.index(r.category) if r.category in CATEGORIES else 0)
+        category_options = get_category_options(df) + [CUSTOM_CATEGORY_OPTION]
+        current_category = str(r.category or "Other")
+        category_index = category_options.index(current_category) if current_category in category_options else category_options.index(CUSTOM_CATEGORY_OPTION)
+        cat_selection=c1.selectbox("Correct category",category_options,index=category_index, key="learning_category")
+        custom_cat = ""
+        if cat_selection == CUSTOM_CATEGORY_OPTION:
+            custom_cat = c1.text_input("Enter custom category", value=current_category if current_category not in CATEGORIES else "", key="learning_custom_category", placeholder="e.g. Investment")
         classes=["Expense","EMI","Income","Transfer"]
-        cl=c2.selectbox("Correct class",classes,index=classes.index(r["class"]) if r["class"] in classes else 0)
+        cl=c2.selectbox("Correct class",classes,index=classes.index(r["class"]) if r["class"] in classes else 0, key="learning_class")
         default=suggest_rule_pattern(r.description)
-        pattern=c3.text_input("Merchant pattern to learn",default)
-        st.caption("Use a distinctive merchant/lender term. Example: PNBHOUSINGFIN or a specific merchant name. Avoid generic terms such as ACH or UPI.")
-        if st.button("Save correction & update similar transactions",type="primary"):
+        pattern=c3.text_input("Merchant pattern to learn",default, key="learning_pattern")
+        st.caption("Saving a correction updates the selected transaction and other transactions matching the same merchant pattern. Custom categories are retained for future corrections and imports.")
+        if st.button("Save correction & update similar transactions", type="primary"):
             try:
-                action=save_rule(pattern,cat,cl)
-                updated=apply_learning_rule(pattern,cat,cl,source_description=r.description)
-                st.success(f"Rule {action}. Updated {updated} matching existing transaction(s). Future matching imports will use this rule automatically.")
+                cat = resolve_category(cat_selection, custom_cat)
+                status=save_rule(pattern,cat,cl)
+                updated_count = apply_learning_to_similar_transactions(pattern, cat, cl, int(r.id))
+                st.success(f"Learning rule saved. Updated {updated_count} similar transaction(s), including the selected transaction.")
                 st.rerun()
             except Exception as e:
-                st.error(f"Could not save the learning rule: {e}")
+                st.error(str(e))
     rules=load_rules()
     if rules:
         st.dataframe(pd.DataFrame(rules,columns=["Pattern","Category","Class"]),use_container_width=True,hide_index=True)
@@ -1002,113 +901,27 @@ with tabs[2]:
 # Recurring
 with tabs[3]:
     st.subheader("🔁 Recurring payments")
-    st.caption("Recurring payments are detected from transaction history. EMI rows are used as monthly mandatory commitments in the Runway planner unless you delete them here.")
-    rec=recurring(get_txns())
+    current_txns=get_txns()
+    rec=recurring(current_txns)
     if rec.empty:
-        st.info("No recurring payments are currently detected. EMI transactions are surfaced even when only one historical occurrence is available; other recurring payments need at least two occurrences.")
-    else:
-        monthly_emi=float(rec[(rec["Type"]=="EMI") & (rec["Frequency"]=="Monthly")]["Typical Amount"].sum())
-        m1,m2,m3=st.columns(3)
-        m1.metric("Active monthly EMI commitments",f"₹{monthly_emi:,.0f}")
-        m2.metric("Detected EMI rows",str(int((rec["Type"]=="EMI").sum())))
-        m3.metric("Recurring rows",str(len(rec)))
-        st.caption("Runway automatically uses the Active monthly EMI commitments amount above. Remove any non-mandatory EMI/recurring row below to exclude it from Runway; the underlying bank transactions remain untouched.")
-        display_cols=["Merchant / Description","Frequency","Typical Amount","Occurrences","Last Seen","Type"]
-        st.dataframe(rec[display_cols],use_container_width=True,hide_index=True)
-        st.markdown("### Manage recurring commitments")
-        st.caption("Removing a recurring row only excludes that detected pattern from this list and the Runway calculation. It does not delete the original transaction.")
-        rec_options=list(rec.index)
-        ridx=st.selectbox("Recurring payment to remove",rec_options,
-                          format_func=lambda i:f"{rec.loc[i,'Merchant / Description']} | {rec.loc[i,'Frequency']} | ₹{rec.loc[i,'Typical Amount']:,.0f} | {rec.loc[i,'Type']}")
-        if st.button("🗑️ Remove selected recurring payment",type="secondary"):
-            try:
-                ok, mode = exclude_recurring(rec.loc[ridx,"_recurring_key"])
-                if ok:
-                    st.success("Recurring payment removed. Its transactions were not deleted, and it will no longer be included in Runway EMI commitments.")
-                else:
-                    st.warning("Recurring payment removed for this session. To keep the exclusion after reboot, run the one-time Supabase recurring_exclusions migration.")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Could not remove the recurring payment: {e}")
-
-    # Show excluded patterns so the user can restore a mistakenly removed EMI.
-    excluded_df=pd.DataFrame()
-    try:
-        if recurring_exclusions_available():
-            excluded_rows=db_select("recurring_exclusions")
-            excluded_df=pd.DataFrame(excluded_rows) if excluded_rows else pd.DataFrame()
+        emi_candidates = current_txns[
+            (current_txns.direction=="Debit") &
+            ((current_txns["class"].astype(str).str.upper()=="EMI") |
+             (current_txns["category"].astype(str).str.lower()=="loan emi"))
+        ] if not current_txns.empty else pd.DataFrame()
+        if not emi_candidates.empty:
+            st.info("EMI transactions are present, but there are not yet enough matching monthly entries to confirm a recurring schedule. Import at least two months of the same EMI or correct the lender transaction under Learning.")
         else:
-            fallback_rows=list(_fallback_exclusions().values())
-            excluded_df=pd.DataFrame(fallback_rows) if fallback_rows else pd.DataFrame()
-            if supabase_enabled():
-                st.info("Recurring-payment removal is working for this session. Run the one-time `supabase_recurring_exclusions_migration.sql` to persist exclusions across reboots.")
-    except Exception:
-        fallback_rows=list(_fallback_exclusions().values())
-        excluded_df=pd.DataFrame(fallback_rows) if fallback_rows else pd.DataFrame()
-    if not excluded_df.empty:
-        with st.expander("↩️ Restore removed recurring payments"):
-            if "id" not in excluded_df.columns:
-                excluded_df["id"] = range(-1, -len(excluded_df)-1, -1)
-            exid=st.selectbox("Removed recurring pattern",excluded_df.id.tolist(),
-                              format_func=lambda x:excluded_df.loc[excluded_df.id==x,"recurring_key"].iloc[0])
-            if st.button("Restore selected recurring payment"):
-                selected_key=str(excluded_df.loc[excluded_df.id==exid,"recurring_key"].iloc[0])
-                real_id=None if int(exid)<0 else int(exid)
-                if restore_recurring(real_id, selected_key):
-                    st.success("Recurring payment restored.")
-                    st.rerun()
-                else:
-                    st.error("Could not restore the recurring payment. Please check the Supabase migration and try again.")
+            st.info("No recurring payment pattern has been confirmed yet. Import at least two occurrences of a payment, or classify an EMI as Loan EMI / EMI under Learning.")
+    else:
+        st.dataframe(rec,use_container_width=True,hide_index=True)
+        st.caption("EMIs are detected from EMI/Loan EMI classifications plus stable monthly amount/date patterns. ACH/NACH transaction IDs are ignored when identifying the lender.")
+        st.info("Tip: if an EMI is not detected, correct one transaction in 🧠 Learning as 'Loan EMI / EMI'. Future matching transactions will then be classified and included in recurring detection.")
 
 # Loans
 with tabs[4]:
     st.subheader("🏦 Loans & EMI amortization")
     st.caption("Use the current outstanding principal and confirmed lender terms. This is a planning estimate, not a lender statement.")
-    loans=get_loans()
-
-    if not loans.empty:
-        lid=st.selectbox("Select existing loan",loans.id.tolist(),format_func=lambda x:loans.loc[loans.id==x,"name"].iloc[0],key="loan_select")
-        l=loans[loans.id==lid].iloc[0]
-        st.markdown("### Edit selected loan")
-        with st.form(f"edit_loan_{int(lid)}"):
-            a,b,c=st.columns(3)
-            name=a.text_input("Loan name",str(l.name))
-            lender=a.text_input("Lender",str(l.lender or ""))
-            principal=b.number_input("Current outstanding principal",min_value=0.0,value=float(l.principal),step=10000.0)
-            rate=b.number_input("Annual interest %",min_value=0.0,value=float(l.annual_rate),step=0.05)
-            tenure=c.number_input("Remaining tenure (months)",min_value=1,value=int(l.tenure_months),step=1)
-            known_emi=c.number_input("Current EMI (0 = calculate)",min_value=0.0,value=float(l.emi),step=100.0)
-            start=st.date_input("Next payment month",pd.to_datetime(l.start_date).date())
-            extra=st.number_input("Optional extra principal/month",min_value=0.0,value=float(l.extra_payment or 0),step=1000.0)
-            save_edit=st.form_submit_button("💾 Update loan",type="primary")
-        if save_edit:
-            try:
-                pay=known_emi if known_emi else emi_payment(principal,rate,tenure)
-                db_update("loans",int(lid),{"name":name,"lender":lender,"principal":principal,"annual_rate":rate,
-                                          "emi":pay,"start_date":str(start),"tenure_months":int(tenure),"extra_payment":extra})
-                st.success("Loan updated successfully.")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Could not update the loan: {e}")
-        if st.button("🗑️ Delete selected loan",key=f"delete_loan_{int(lid)}"):
-            try:
-                db_delete("loans",int(lid))
-                st.success("Loan deleted. Related transactions were not deleted.")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Could not delete the loan: {e}")
-
-        loans=get_loans()
-        l=loans[loans.id==lid].iloc[0] if not loans.empty and int(lid) in loans.id.tolist() else None
-        if l is not None:
-            sch=amortize(l.principal,l.annual_rate,int(l.tenure_months),l.start_date,l.emi,l.extra_payment)
-            x,y,z=st.columns(3)
-            x.metric("Monthly EMI",f"₹{l.emi:,.0f}")
-            y.metric("Future interest",f"₹{sch.Interest.sum():,.0f}")
-            z.metric("Estimated completion",str(sch["Due Date"].iloc[-1]) if not sch.empty else "—")
-            st.dataframe(sch,use_container_width=True,hide_index=True)
-
-    st.markdown("### Add new loan")
     with st.form("loan"):
         a,b,c=st.columns(3)
         name=a.text_input("Loan name","Home Loan")
@@ -1117,15 +930,25 @@ with tabs[4]:
         rate=b.number_input("Annual interest %",min_value=0.0,value=8.0,step=0.05)
         tenure=c.number_input("Remaining tenure (months)",min_value=1,value=120,step=1)
         known_emi=c.number_input("Current EMI (0 = calculate)",min_value=0.0,value=0.0,step=100.0)
-        start=st.date_input("Next payment month",date.today(),key="new_loan_start")
-        extra=st.number_input("Optional extra principal/month",min_value=0.0,value=0.0,step=1000.0,key="new_loan_extra")
-        save=st.form_submit_button("Add loan",type="primary")
+        start=st.date_input("Next payment month",date.today())
+        extra=st.number_input("Optional extra principal/month",min_value=0.0,value=0.0,step=1000.0)
+        save=st.form_submit_button("Save loan")
     if save:
         pay=known_emi if known_emi else emi_payment(principal,rate,tenure)
         db_insert("loans",{"name":name,"lender":lender,"principal":principal,"annual_rate":rate,
                            "emi":pay,"start_date":str(start),"tenure_months":int(tenure),"extra_payment":extra})
         st.success("Loan saved.")
         st.rerun()
+    loans=get_loans()
+    if not loans.empty:
+        lid=st.selectbox("Loan",loans.id.tolist(),format_func=lambda x:loans.loc[loans.id==x,"name"].iloc[0])
+        l=loans[loans.id==lid].iloc[0]
+        sch=amortize(l.principal,l.annual_rate,int(l.tenure_months),l.start_date,l.emi,l.extra_payment)
+        x,y,z=st.columns(3)
+        x.metric("Monthly EMI",f"₹{l.emi:,.0f}")
+        y.metric("Future interest",f"₹{sch.Interest.sum():,.0f}")
+        z.metric("Estimated completion",str(sch["Due Date"].iloc[-1]) if not sch.empty else "—")
+        st.dataframe(sch,use_container_width=True,hide_index=True)
 
 # Runway
 with tabs[5]:
@@ -1189,13 +1012,12 @@ with tabs[5]:
     st.markdown("### 🧮 Runway assumptions")
     df=get_txns(); ms=monthly_series(df)
     hist=float(ms.debit.tail(6).mean()) if not ms.empty else 0
-    recurring_emi=recurring_emi_total(df)
+    emi_hist=float(df[(df.direction=="Debit")&(df["class"]=="EMI")].groupby(df.txn_date.str[:7]).amount.sum().tail(6).mean()) if not df.empty else 0
     a,b,c,d=st.columns(4)
     liquid=a.number_input("Current liquid funds (₹)",min_value=0.0,value=0.0,step=10000.0)
-    essential=b.number_input("Monthly essential burn excluding EMI (₹)",min_value=0.0,value=max(0.0,hist-recurring_emi),step=5000.0)
-    emi_m=c.number_input("Monthly EMI commitments (₹)",min_value=0.0,value=max(0.0,recurring_emi),step=5000.0,disabled=True,help="Automatically calculated from active EMI rows in Recurring Payments. Remove a non-mandatory recurring row there to exclude it.")
+    essential=b.number_input("Monthly essential burn excluding EMI (₹)",min_value=0.0,value=max(0.0,hist-emi_hist),step=5000.0)
+    emi_m=c.number_input("Monthly EMI commitment (₹)",min_value=0.0,value=max(0.0,emi_hist),step=5000.0)
     reduction=d.slider("Discretionary-spending reduction",0,100,35)
-    st.caption(f"🔒 Runway is using ₹{recurring_emi:,.0f}/month from active recurring EMI commitments. Delete any non-mandatory recurring payment in the Recurring tab to remove it from this calculation.")
     e,f=st.columns(2)
     gap=e.number_input("Expected no-salary period (months)",min_value=0,max_value=60,value=6)
     planned_trade=f.number_input("Planned monthly trading P/L (₹)",value=0.0,step=1000.0,help="Use 0 for a conservative case. Positive numbers are expected profit; negative numbers are expected loss.")
@@ -1261,13 +1083,25 @@ with tabs[6]:
             tid=st.selectbox("Select transaction to edit/delete",view.id.tolist())
             r=view[view.id==tid].iloc[0]
             c1,c2,c3=st.columns(3)
-            newcat=c1.selectbox("Category",CATEGORIES,index=CATEGORIES.index(r.category) if r.category in CATEGORIES else 0)
+            txn_category_options=get_category_options(df) + [CUSTOM_CATEGORY_OPTION]
+            current_txn_category=str(r.category or "Other")
+            txn_cat_selection=c1.selectbox("Category",txn_category_options,index=txn_category_options.index(current_txn_category) if current_txn_category in txn_category_options else txn_category_options.index(CUSTOM_CATEGORY_OPTION), key="txn_category_edit")
+            txn_custom_cat=""
+            if txn_cat_selection == CUSTOM_CATEGORY_OPTION:
+                txn_custom_cat=c1.text_input("Enter custom category",value=current_txn_category if current_txn_category not in CATEGORIES else "",key="txn_custom_category")
+            newcat=resolve_category(txn_cat_selection,txn_custom_cat) if txn_cat_selection != CUSTOM_CATEGORY_OPTION else txn_cat_selection
             classes=["Expense","EMI","Income","Transfer"]
             newcl=c2.selectbox("Class",classes,index=classes.index(r["class"]) if r["class"] in classes else 0)
             newdesc=c3.text_input("Description",str(r.description))
             b1,b2=st.columns(2)
             if b1.button("Update transaction"):
-                db_update_txn(int(tid),{"description":newdesc,"category":newcat,"class":newcl})
+                try:
+                    final_category = resolve_category(txn_cat_selection,txn_custom_cat)
+                    db_update_txn(int(tid),{"description":newdesc,"category":final_category,"class":newcl})
+                    st.success("Updated.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
                 st.success("Updated.")
                 st.rerun()
             if b2.button("Delete transaction"):

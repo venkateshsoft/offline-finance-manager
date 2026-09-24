@@ -177,127 +177,155 @@ def fingerprint(d, desc, amt, direction):
     return hashlib.sha256(raw.encode()).hexdigest()
 
 # ---------------- Import ----------------
-# Bank statements often contain decorative title rows above the real header,
-# and Indian banks use different names such as Narration / Withdrawal Amt. /
-# Deposit Amt.  The importer normalizes these variations before processing.
-def _clean_col_name(value):
+def _clean_header(value):
+    """Normalize bank column names for reliable matching."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
     s=str(value).strip().lower()
     s=s.replace("&"," and ")
     s=re.sub(r"[^a-z0-9]+"," ",s)
-    return re.sub(r"\\s+"," ",s).strip()
+    return re.sub(r"\s+"," ",s).strip()
 
-DATE_ALIASES = [
-    "date","transaction date","txn date","tran date","posting date",
-    "value date","value dt"
-]
-DESC_ALIASES = [
-    "description","narration","transaction details","transaction description",
-    "particulars","remarks","transaction remarks","details"
-]
-CREDIT_ALIASES = [
-    "credit","credits","credit amount","cr","cr amount",
-    "deposit","deposit amt","deposit amount"
-]
-DEBIT_ALIASES = [
-    "debit","debits","debit amount","dr","dr amount",
-    "withdrawal","withdrawal amt","withdrawal amount"
-]
-AMOUNT_ALIASES = ["amount","transaction amount"]
-BALANCE_ALIASES = ["balance","closing balance","available balance"]
+def _is_header_candidate(row):
+    """Return True when a row looks like a bank transaction header."""
+    vals=[_clean_header(v) for v in row.tolist()]
+    joined=" | ".join(v for v in vals if v)
+    has_date=any(v in joined for v in ["date","transaction date","txn date","tran date","posting date","value dt","value date"])
+    has_desc=any(v in joined for v in ["narration","description","particulars","transaction details","transaction description","remarks","details"])
+    return has_date and has_desc
 
-def _find_header_row(df):
-    """Find the row containing the actual bank-statement headers."""
-    if df.empty:
-        return None
+def _find_header_row(raw):
+    """Find the actual header row, even when decorative rows precede it."""
+    scan=raw.head(min(len(raw),30))
+    for idx,row in scan.iterrows():
+        if _is_header_candidate(row):
+            return idx
+    return None
 
-    # If pandas already supplied useful column names, use them.
-    normalized_columns = {_clean_col_name(c) for c in df.columns}
-    if any(x in normalized_columns for x in DATE_ALIASES) and any(x in normalized_columns for x in DESC_ALIASES):
-        return -1
+def _read_uploaded_statement(uploaded_file):
+    """
+    Read CSV/XLS/XLSX from in-memory bytes.
+    Explicit engines avoid ambiguous Excel reader selection and reduce
+    file-handle/resource issues with Streamlit UploadedFile.
+    """
+    name=uploaded_file.name.lower()
+    data=uploaded_file.getvalue()
 
-    # Otherwise inspect the first 30 rows for a header containing Date + Narration/Description.
-    limit=min(len(df),30)
-    best_row=None
-    best_score=-1
-    for i in range(limit):
-        values=[_clean_col_name(v) for v in df.iloc[i].tolist()]
-        value_set=set(values)
-        score=0
-        if any(x in value_set for x in DATE_ALIASES): score += 4
-        if any(x in value_set for x in DESC_ALIASES): score += 4
-        if any(x in value_set for x in DEBIT_ALIASES): score += 1
-        if any(x in value_set for x in CREDIT_ALIASES): score += 1
-        if any(x in value_set for x in BALANCE_ALIASES): score += 1
-        if score>best_score:
-            best_score=score
-            best_row=i
-    return best_row if best_score>=8 else None
+    if not data:
+        raise ValueError("The uploaded statement is empty.")
 
-def _parse_amount(value):
-    if pd.isna(value):
-        return np.nan
-    s=str(value).strip()
-    if not s or s.lower() in {"nan","none","-","--"}:
-        return np.nan
-    negative=s.startswith("(") and s.endswith(")")
-    s=s.replace(",","").replace("₹","").replace("$","").replace(" ","")
-    s=s.replace("(","").replace(")","")
-    s=re.sub(r"(?i)(cr|dr)$","",s)
-    try:
-        val=float(s)
-        return -abs(val) if negative else val
-    except (TypeError,ValueError):
-        return np.nan
+    if name.endswith(".csv"):
+        raw=pd.read_csv(BytesIO(data),header=None,dtype=object)
+    elif name.endswith(".xls"):
+        try:
+            raw=pd.read_excel(BytesIO(data),header=None,engine="xlrd",dtype=object)
+        except ImportError as e:
+            raise ValueError("The app cannot load .xls files because xlrd is unavailable in the deployed environment. Please redeploy with xlrd>=2.0.") from e
+        except Exception as e:
+            raise ValueError(f"Could not read this .xls file with xlrd: {e}") from e
+    elif name.endswith(".xlsx"):
+        try:
+            raw=pd.read_excel(BytesIO(data),header=None,engine="openpyxl",dtype=object)
+        except ImportError as e:
+            raise ValueError("The app cannot load .xlsx files because openpyxl is unavailable in the deployed environment.") from e
+        except Exception as e:
+            raise ValueError(f"Could not read this .xlsx file with openpyxl: {e}") from e
+    else:
+        raise ValueError("Unsupported file format. Please upload CSV, XLSX, or XLS.")
+
+    if raw.empty:
+        raise ValueError("The uploaded statement contains no readable rows.")
+
+    header_row=_find_header_row(raw)
+    if header_row is None:
+        preview=[str(x).strip() for x in raw.iloc[0].tolist()[:12]]
+        raise ValueError(
+            "Could not find the bank statement header row. "
+            f"First row detected: {preview}"
+        )
+
+    headers=[]
+    seen={}
+    for i,v in enumerate(raw.iloc[header_row].tolist()):
+        h=str(v).strip() if not pd.isna(v) else ""
+        if not h:
+            h=f"Unnamed_{i}"
+        # Keep duplicate headers unique.
+        base=h
+        n=seen.get(base,0)
+        seen[base]=n+1
+        if n:
+            h=f"{base}_{n+1}"
+        headers.append(h)
+
+    df=raw.iloc[header_row+1:].copy()
+    df.columns=headers
+    df=df.dropna(how="all").reset_index(drop=True)
+    return df, header_row
 
 def normalize_statement(df):
-    header_row=_find_header_row(df)
-    if header_row is not None and header_row>=0:
-        headers=[str(x).strip() for x in df.iloc[header_row].tolist()]
-        df=df.iloc[header_row+1:].copy()
-        df.columns=headers
-    elif header_row is None:
-        raise ValueError(
-            "Could not identify the bank statement header row. "
-            "Expected columns such as Date + Narration/Description."
-        )
+    cols={_clean_header(c):c for c in df.columns}
 
-    # Clean duplicate/blank column names while preserving the original columns.
-    cols={}
-    for c in df.columns:
-        cols[_clean_col_name(c)]=c
+    date_keys=[
+        "date","transaction date","txn date","tran date","posting date",
+        "value date","value dt"
+    ]
+    desc_keys=[
+        "description","narration","particulars","transaction details",
+        "transaction description","remarks","details"
+    ]
+    credit_keys=[
+        "credit","credits","credit amount","deposit","deposit amount",
+        "deposit amt","cr amount","cr"
+    ]
+    debit_keys=[
+        "debit","debits","debit amount","withdrawal","withdrawal amount",
+        "withdrawal amt","dr amount","dr"
+    ]
+    amount_keys=["amount","transaction amount"]
 
-    date_col=next((cols[k] for k in DATE_ALIASES if k in cols),None)
-    desc_col=next((cols[k] for k in DESC_ALIASES if k in cols),None)
-    credit_col=next((cols[k] for k in CREDIT_ALIASES if k in cols),None)
-    debit_col=next((cols[k] for k in DEBIT_ALIASES if k in cols),None)
-    amount_col=next((cols[k] for k in AMOUNT_ALIASES if k in cols),None)
+    def find(keys):
+        for k in keys:
+            if k in cols:
+                return cols[k]
+        # Allow punctuation/spacing variations by matching normalized names.
+        for normalized,original in cols.items():
+            for k in keys:
+                if normalized == _clean_header(k):
+                    return original
+        return None
+
+    date_col=find(date_keys)
+    desc_col=find(desc_keys)
+    credit_col=find(credit_keys)
+    debit_col=find(debit_keys)
+    amount_col=find(amount_keys)
 
     if not date_col or not desc_col:
-        detected=", ".join(str(c) for c in df.columns)
         raise ValueError(
             "Could not identify Date and Description/Narration columns. "
-            f"Detected columns: {detected}"
-        )
-    if not credit_col and not debit_col and not amount_col:
-        raise ValueError(
-            "Could not identify Debit/Withdrawal or Credit/Deposit columns."
+            f"Detected columns: {list(df.columns)}"
         )
 
     out=[]
     for _,r in df.iterrows():
-        # Indian bank statements commonly use DD/MM/YYYY.
         d=pd.to_datetime(r[date_col],errors="coerce",dayfirst=True)
         if pd.isna(d):
             continue
 
         desc=str(r[desc_col]).strip()
         if not desc or desc.lower()=="nan":
-            continue
+            desc="Unspecified transaction"
 
-        credit=_parse_amount(r[credit_col]) if credit_col else np.nan
-        debit=_parse_amount(r[debit_col]) if debit_col else np.nan
+        credit=pd.to_numeric(
+            str(r[credit_col]).replace(",","").strip() if credit_col and pd.notna(r[credit_col]) else np.nan,
+            errors="coerce"
+        ) if credit_col else np.nan
+        debit=pd.to_numeric(
+            str(r[debit_col]).replace(",","").strip() if debit_col and pd.notna(r[debit_col]) else np.nan,
+            errors="coerce"
+        ) if debit_col else np.nan
 
-        # Prefer explicit credit/debit columns. A zero/blank in one column is normal.
         if pd.notna(credit) and float(credit)!=0:
             amt=abs(float(credit))
             direction="Credit"
@@ -305,11 +333,17 @@ def normalize_statement(df):
             amt=abs(float(debit))
             direction="Debit"
         elif amount_col:
-            val=_parse_amount(r[amount_col])
-            if pd.isna(val) or float(val)==0:
+            raw_amount=str(r[amount_col]).replace(",","").strip()
+            if not raw_amount or raw_amount.lower()=="nan":
                 continue
-            amt=abs(float(val))
-            direction="Credit" if float(val)>=0 else "Debit"
+            try:
+                val=float(raw_amount)
+            except ValueError:
+                continue
+            if val==0:
+                continue
+            amt=abs(val)
+            direction="Credit" if val>=0 else "Debit"
         else:
             continue
 
@@ -479,11 +513,9 @@ with tabs[1]:
     f=st.file_uploader("Choose a statement",type=["csv","xlsx","xls"])
     if f:
         try:
-            # Read without assuming the first row is the header. Some bank
-            # statements put a decorative/title row above the real headers.
-            raw=pd.read_csv(f,header=None) if f.name.lower().endswith(".csv") else pd.read_excel(f,header=None)
+            raw, header_row=_read_uploaded_statement(f)
             norm=normalize_statement(raw)
-            st.success(f"Detected {len(norm)} transactions.")
+            st.success(f"Statement loaded successfully. Header row: {header_row + 1}. Detected {len(norm)} transactions.")
             st.dataframe(norm.head(50),use_container_width=True,hide_index=True)
             if st.button("Import transactions",type="primary"):
                 n=save_transactions(norm,f.name)

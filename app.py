@@ -197,71 +197,103 @@ def _is_header_candidate(row):
 
 def _find_header_row(raw):
     """Find the actual header row, even when decorative rows precede it."""
-    scan=raw.head(min(len(raw),30))
+    scan=raw.head(min(len(raw),50))
     for idx,row in scan.iterrows():
         if _is_header_candidate(row):
             return idx
     return None
 
 def _read_uploaded_statement(uploaded_file):
-    """
-    Read CSV/XLS/XLSX from in-memory bytes.
-    Explicit engines avoid ambiguous Excel reader selection and reduce
-    file-handle/resource issues with Streamlit UploadedFile.
-    """
-    name=uploaded_file.name.lower()
-    data=uploaded_file.getvalue()
+    """Safely read CSV/XLS/XLSX into a DataFrame.
 
+    XLS is handled directly with xlrd instead of pandas.read_excel. This is
+    intentionally lightweight and avoids ExcelFile/workbook resource issues
+    that can terminate a Streamlit worker on some hosted environments.
+    """
+    name = str(uploaded_file.name or "").lower()
+    data = uploaded_file.getvalue()
     if not data:
         raise ValueError("The uploaded statement is empty.")
 
-    if name.endswith(".csv"):
-        raw=pd.read_csv(BytesIO(data),header=None,dtype=object)
-    elif name.endswith(".xls"):
-        try:
-            raw=pd.read_excel(BytesIO(data),header=None,engine="xlrd",dtype=object)
-        except ImportError as e:
-            raise ValueError("The app cannot load .xls files because xlrd is unavailable in the deployed environment. Please redeploy with xlrd>=2.0.") from e
-        except Exception as e:
-            raise ValueError(f"Could not read this .xls file with xlrd: {e}") from e
-    elif name.endswith(".xlsx"):
-        try:
-            raw=pd.read_excel(BytesIO(data),header=None,engine="openpyxl",dtype=object)
-        except ImportError as e:
-            raise ValueError("The app cannot load .xlsx files because openpyxl is unavailable in the deployed environment.") from e
-        except Exception as e:
-            raise ValueError(f"Could not read this .xlsx file with openpyxl: {e}") from e
-    else:
-        raise ValueError("Unsupported file format. Please upload CSV, XLSX, or XLS.")
+    try:
+        if name.endswith(".csv"):
+            raw = pd.read_csv(BytesIO(data), header=None, dtype=object)
 
-    if raw.empty:
+        elif name.endswith(".xls"):
+            try:
+                import xlrd
+            except Exception as e:
+                raise ValueError(
+                    "The deployed app cannot import xlrd. Your requirements.txt contains xlrd, "
+                    "so please wait for Streamlit to finish rebuilding the environment and retry."
+                ) from e
+
+            try:
+                # Direct xlrd parsing is more reliable for legacy BIFF .xls files.
+                book = xlrd.open_workbook(file_contents=data, on_demand=True)
+                if book.nsheets < 1:
+                    raise ValueError("The .xls workbook contains no worksheets.")
+                sheet = book.sheet_by_index(0)
+                rows = [sheet.row_values(i) for i in range(sheet.nrows)]
+                raw = pd.DataFrame(rows, dtype=object)
+                # Release workbook resources as early as possible.
+                try:
+                    book.release_resources()
+                except Exception:
+                    pass
+            except Exception as e:
+                raise ValueError(
+                    "The .xls file could not be parsed by xlrd. "
+                    f"Details: {type(e).__name__}: {e}"
+                ) from e
+
+        elif name.endswith(".xlsx"):
+            try:
+                raw = pd.read_excel(BytesIO(data), header=None, engine="openpyxl", dtype=object)
+            except Exception as e:
+                raise ValueError(
+                    "The .xlsx file could not be parsed by openpyxl. "
+                    f"Details: {type(e).__name__}: {e}"
+                ) from e
+        else:
+            raise ValueError("Unsupported file format. Please upload CSV, XLSX, or XLS.")
+
+    except MemoryError as e:
+        raise ValueError("The statement is too large for the available Streamlit memory.") from e
+    except OSError as e:
+        raise ValueError(
+            "The hosted app ran out of an OS resource while reading the statement. "
+            "The importer has been designed to read .xls directly; please retry after the app finishes restarting. "
+            f"Details: {e}"
+        ) from e
+
+    if raw is None or raw.empty:
         raise ValueError("The uploaded statement contains no readable rows.")
 
-    header_row=_find_header_row(raw)
+    header_row = _find_header_row(raw)
     if header_row is None:
-        preview=[str(x).strip() for x in raw.iloc[0].tolist()[:12]]
+        preview = [str(x).strip() for x in raw.iloc[0].tolist()[:12]]
         raise ValueError(
             "Could not find the bank statement header row. "
             f"First row detected: {preview}"
         )
 
-    headers=[]
-    seen={}
-    for i,v in enumerate(raw.iloc[header_row].tolist()):
-        h=str(v).strip() if not pd.isna(v) else ""
+    headers = []
+    seen = {}
+    for i, v in enumerate(raw.iloc[header_row].tolist()):
+        h = str(v).strip() if not pd.isna(v) else ""
         if not h:
-            h=f"Unnamed_{i}"
-        # Keep duplicate headers unique.
-        base=h
-        n=seen.get(base,0)
-        seen[base]=n+1
+            h = f"Unnamed_{i}"
+        base = h
+        n = seen.get(base, 0)
+        seen[base] = n + 1
         if n:
-            h=f"{base}_{n+1}"
+            h = f"{base}_{n+1}"
         headers.append(h)
 
-    df=raw.iloc[header_row+1:].copy()
-    df.columns=headers
-    df=df.dropna(how="all").reset_index(drop=True)
+    df = raw.iloc[header_row + 1:].copy()
+    df.columns = headers
+    df = df.dropna(how="all").reset_index(drop=True)
     return df, header_row
 
 def normalize_statement(df):

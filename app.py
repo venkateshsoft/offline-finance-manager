@@ -135,31 +135,6 @@ def db_update(table, row_id, data):
     c.execute(f"UPDATE {table} SET {sets} WHERE id=?",(*data.values(),row_id))
     c.commit()
 
-# ---------------- Safe data reset ----------------
-RESETTABLE_TABLES = [
-    "transactions",
-    "rules",
-    "loans",
-    "income_sources",
-    "trading_results",
-]
-
-def reset_all_financial_data():
-    """Delete user-entered/test financial data from every storage backend.
-
-    Authentication/secrets and application code are not affected.
-    """
-    if supabase_enabled():
-        for table in RESETTABLE_TABLES:
-            # All application IDs are positive serial/identity values.
-            get_supabase().table(table).delete().neq("id", 0).execute()
-        return
-
-    c=local_conn()
-    for table in RESETTABLE_TABLES:
-        c.execute(f"DELETE FROM {table}")
-    c.commit()
-
 # ---------------- Classification ----------------
 BUILTIN = [
 ("swiggy","Food","Expense"),("zomato","Food","Expense"),("dominos","Food","Expense"),
@@ -188,10 +163,13 @@ def load_rules():
     rows=db_select("rules")
     return [(r["pattern"],r["category"],r["class"]) for r in rows]
 
-def classify(desc):
+def classify(desc, rules=None):
+    """Classify a transaction without re-querying the database for every row."""
     s=str(desc).lower()
-    for p,cat,cl in load_rules():
-        if p.lower() in s: return cat,cl
+    if rules is None:
+        rules=load_rules()
+    for p,cat,cl in rules:
+        if str(p).lower() in s: return cat,cl
     for p,cat,cl in BUILTIN:
         if p in s: return cat,cl
     if any(x in s for x in ["atm","cash withdrawal"]): return "Cash Withdrawal","Expense"
@@ -365,6 +343,10 @@ def normalize_statement(df):
             f"Detected columns: {list(df.columns)}"
         )
 
+    # Load user classification rules once. The previous implementation queried
+    # the database for every transaction, which could create hundreds/thousands
+    # of unnecessary database calls during a bank-statement import.
+    rules=load_rules()
     out=[]
     for _,r in df.iterrows():
         d=pd.to_datetime(r[date_col],errors="coerce",dayfirst=True)
@@ -405,7 +387,7 @@ def normalize_statement(df):
         else:
             continue
 
-        cat,cl=classify(desc)
+        cat,cl=classify(desc, rules)
         out.append([d.date().isoformat(),desc,amt,direction,cat,cl])
 
     return pd.DataFrame(
@@ -414,22 +396,101 @@ def normalize_statement(df):
     )
 
 def save_transactions(df, source="import"):
+    """Persist imported transactions efficiently and safely.
+
+    The old implementation performed a database duplicate check and then an
+    insert for every row (and, for SQLite, read the entire transaction table
+    before and after every insert). That pattern is very expensive on
+    Streamlit Community Cloud and can exhaust available resources.
+
+    This version calculates fingerprints locally and writes in batches.
+    Supabase uses its bulk upsert/ignore-duplicates support, while SQLite uses
+    INSERT OR IGNORE with executemany.
+    """
+    if df is None or df.empty:
+        return 0
+
+    required=["txn_date","description","amount","direction","category","class"]
+    missing=[c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Import data is missing required columns: {', '.join(missing)}")
+
+    rows=[]
+    seen=set()
+    import_view=df[required]
+    for txn_date,description,amount,direction,category,txn_class in import_view.itertuples(index=False, name=None):
+        txn_date=str(txn_date)
+        description=str(description)
+        amount=float(amount)
+        direction=str(direction)
+        fp=fingerprint(txn_date,description,amount,direction)
+        # Also remove duplicates occurring inside the uploaded file itself.
+        if fp in seen:
+            continue
+        seen.add(fp)
+        rows.append({
+            "txn_date":txn_date,
+            "description":description,
+            "amount":amount,
+            "direction":direction,
+            "category":str(category),
+            "class":str(txn_class),
+            "source":source,
+            "fingerprint":fp
+        })
+
+    if not rows:
+        return 0
+
+    # Keep request sizes moderate for hosted environments.
+    batch_size=500
     added=0
-    for _,r in df.iterrows():
-        fp=fingerprint(r.txn_date,r.description,r.amount,r.direction)
-        data={"txn_date":r.txn_date,"description":r.description,"amount":float(r.amount),
-              "direction":r.direction,"category":r.category,"class":r["class"],
-              "source":source,"fingerprint":fp}
+
+    try:
         if supabase_enabled():
-            exists=get_supabase().table("transactions").select("id").eq("fingerprint",fp).execute().data
-            if not exists:
-                db_insert("transactions",data); added+=1
+            sb=get_supabase()
+            # Supabase supports bulk insert/upsert with a list of dictionaries.
+            # With a UNIQUE fingerprint, ignore_duplicates makes the import
+            # idempotent without a SELECT for every transaction.
+            for start in range(0,len(rows),batch_size):
+                batch=rows[start:start+batch_size]
+                response=(
+                    sb.table("transactions")
+                    .upsert(batch, on_conflict="fingerprint", ignore_duplicates=True)
+                    .select("id")
+                    .execute()
+                )
+                # With select("id"), the response tells us how many rows were
+                # actually inserted/upserted in this batch.
+                added += len(response.data or [])
         else:
-            before=len(get_txns())
-            db_insert("transactions",data)
-            after=len(get_txns())
-            if after>before: added+=1
-    return added
+            c=local_conn()
+            sql="""INSERT OR IGNORE INTO transactions
+                (txn_date,description,amount,direction,category,class,source,fingerprint)
+                VALUES (?,?,?,?,?,?,?,?)"""
+            for start in range(0,len(rows),batch_size):
+                batch=rows[start:start+batch_size]
+                values=[(x["txn_date"],x["description"],x["amount"],x["direction"],
+                         x["category"],x["class"],x["source"],x["fingerprint"]) for x in batch]
+                before=c.total_changes
+                c.executemany(sql,values)
+                c.commit()
+                added += c.total_changes-before
+            c.close()
+    except OSError as e:
+        raise ValueError(
+            "The hosted app ran out of an operating-system resource while saving the transactions. "
+            "The importer now uses batched database writes; please reboot the Streamlit app and retry. "
+            f"Details: {e}"
+        ) from e
+    except Exception as e:
+        raise ValueError(
+            "The statement was read successfully, but saving the transactions failed. "
+            "No per-row import loop is used now. Please check the database/Streamlit logs. "
+            f"Details: {type(e).__name__}: {e}"
+        ) from e
+
+    return int(added)
 
 def get_txns():
     rows=db_select("transactions")
@@ -810,15 +871,3 @@ with tabs[7]:
     st.write("- Do not put passwords, API keys, bank statements or database files in GitHub.")
     st.write("### Backup")
     st.write("For a serious personal-finance deployment, keep periodic encrypted exports/backups outside the Git repository.")
-
-    st.write("### 🧹 Data reset")
-    st.caption("Use this once to remove the sample/test data you entered while building the app. It does not change your login password, Streamlit Secrets, GitHub files, or application code.")
-    st.warning("⚠️ This will permanently delete ALL saved transactions, learning rules, loans, income sources, and trading P/L from the connected database. This cannot be undone.")
-    confirm_reset = st.checkbox("I understand that this will permanently delete my saved financial data.", key="confirm_full_reset")
-    if st.button("🧹 Reset all sample/test financial data", type="secondary", disabled=not confirm_reset):
-        try:
-            reset_all_financial_data()
-            st.success("All sample/test financial data has been cleared. You can now import your real bank data.")
-            st.rerun()
-        except Exception as e:
-            st.error(f"Reset encountered an error: {e}. Please verify the data before trying again, because a cloud reset can be partially completed if one table rejects the delete.")

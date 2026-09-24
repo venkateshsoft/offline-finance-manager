@@ -177,35 +177,149 @@ def fingerprint(d, desc, amt, direction):
     return hashlib.sha256(raw.encode()).hexdigest()
 
 # ---------------- Import ----------------
+# Bank statements often contain decorative title rows above the real header,
+# and Indian banks use different names such as Narration / Withdrawal Amt. /
+# Deposit Amt.  The importer normalizes these variations before processing.
+def _clean_col_name(value):
+    s=str(value).strip().lower()
+    s=s.replace("&"," and ")
+    s=re.sub(r"[^a-z0-9]+"," ",s)
+    return re.sub(r"\\s+"," ",s).strip()
+
+DATE_ALIASES = [
+    "date","transaction date","txn date","tran date","posting date",
+    "value date","value dt"
+]
+DESC_ALIASES = [
+    "description","narration","transaction details","transaction description",
+    "particulars","remarks","transaction remarks","details"
+]
+CREDIT_ALIASES = [
+    "credit","credits","credit amount","cr","cr amount",
+    "deposit","deposit amt","deposit amount"
+]
+DEBIT_ALIASES = [
+    "debit","debits","debit amount","dr","dr amount",
+    "withdrawal","withdrawal amt","withdrawal amount"
+]
+AMOUNT_ALIASES = ["amount","transaction amount"]
+BALANCE_ALIASES = ["balance","closing balance","available balance"]
+
+def _find_header_row(df):
+    """Find the row containing the actual bank-statement headers."""
+    if df.empty:
+        return None
+
+    # If pandas already supplied useful column names, use them.
+    normalized_columns = {_clean_col_name(c) for c in df.columns}
+    if any(x in normalized_columns for x in DATE_ALIASES) and any(x in normalized_columns for x in DESC_ALIASES):
+        return -1
+
+    # Otherwise inspect the first 30 rows for a header containing Date + Narration/Description.
+    limit=min(len(df),30)
+    best_row=None
+    best_score=-1
+    for i in range(limit):
+        values=[_clean_col_name(v) for v in df.iloc[i].tolist()]
+        value_set=set(values)
+        score=0
+        if any(x in value_set for x in DATE_ALIASES): score += 4
+        if any(x in value_set for x in DESC_ALIASES): score += 4
+        if any(x in value_set for x in DEBIT_ALIASES): score += 1
+        if any(x in value_set for x in CREDIT_ALIASES): score += 1
+        if any(x in value_set for x in BALANCE_ALIASES): score += 1
+        if score>best_score:
+            best_score=score
+            best_row=i
+    return best_row if best_score>=8 else None
+
+def _parse_amount(value):
+    if pd.isna(value):
+        return np.nan
+    s=str(value).strip()
+    if not s or s.lower() in {"nan","none","-","--"}:
+        return np.nan
+    negative=s.startswith("(") and s.endswith(")")
+    s=s.replace(",","").replace("₹","").replace("$","").replace(" ","")
+    s=s.replace("(","").replace(")","")
+    s=re.sub(r"(?i)(cr|dr)$","",s)
+    try:
+        val=float(s)
+        return -abs(val) if negative else val
+    except (TypeError,ValueError):
+        return np.nan
+
 def normalize_statement(df):
-    cols={str(c).strip().lower():c for c in df.columns}
-    date_col=next((cols[k] for k in ["date","transaction date","txn date","value date"] if k in cols),None)
-    desc_col=next((cols[k] for k in ["description","narration","transaction details","remarks","details"] if k in cols),None)
-    credit_col=next((cols[k] for k in ["credit","credits","deposit","cr"] if k in cols),None)
-    debit_col=next((cols[k] for k in ["debit","debits","withdrawal","dr"] if k in cols),None)
-    amount_col=next((cols[k] for k in ["amount","transaction amount"] if k in cols),None)
+    header_row=_find_header_row(df)
+    if header_row is not None and header_row>=0:
+        headers=[str(x).strip() for x in df.iloc[header_row].tolist()]
+        df=df.iloc[header_row+1:].copy()
+        df.columns=headers
+    elif header_row is None:
+        raise ValueError(
+            "Could not identify the bank statement header row. "
+            "Expected columns such as Date + Narration/Description."
+        )
+
+    # Clean duplicate/blank column names while preserving the original columns.
+    cols={}
+    for c in df.columns:
+        cols[_clean_col_name(c)]=c
+
+    date_col=next((cols[k] for k in DATE_ALIASES if k in cols),None)
+    desc_col=next((cols[k] for k in DESC_ALIASES if k in cols),None)
+    credit_col=next((cols[k] for k in CREDIT_ALIASES if k in cols),None)
+    debit_col=next((cols[k] for k in DEBIT_ALIASES if k in cols),None)
+    amount_col=next((cols[k] for k in AMOUNT_ALIASES if k in cols),None)
+
     if not date_col or not desc_col:
-        raise ValueError("Could not identify Date and Description/Narration columns.")
+        detected=", ".join(str(c) for c in df.columns)
+        raise ValueError(
+            "Could not identify Date and Description/Narration columns. "
+            f"Detected columns: {detected}"
+        )
+    if not credit_col and not debit_col and not amount_col:
+        raise ValueError(
+            "Could not identify Debit/Withdrawal or Credit/Deposit columns."
+        )
+
     out=[]
     for _,r in df.iterrows():
-        d=pd.to_datetime(r[date_col],errors="coerce")
-        if pd.isna(d): continue
-        desc=str(r[desc_col])
-        credit=pd.to_numeric(r[credit_col],errors="coerce") if credit_col else np.nan
-        debit=pd.to_numeric(r[debit_col],errors="coerce") if debit_col else np.nan
+        # Indian bank statements commonly use DD/MM/YYYY.
+        d=pd.to_datetime(r[date_col],errors="coerce",dayfirst=True)
+        if pd.isna(d):
+            continue
+
+        desc=str(r[desc_col]).strip()
+        if not desc or desc.lower()=="nan":
+            continue
+
+        credit=_parse_amount(r[credit_col]) if credit_col else np.nan
+        debit=_parse_amount(r[debit_col]) if debit_col else np.nan
+
+        # Prefer explicit credit/debit columns. A zero/blank in one column is normal.
         if pd.notna(credit) and float(credit)!=0:
-            amt=abs(float(credit)); direction="Credit"
+            amt=abs(float(credit))
+            direction="Credit"
         elif pd.notna(debit) and float(debit)!=0:
-            amt=abs(float(debit)); direction="Debit"
+            amt=abs(float(debit))
+            direction="Debit"
         elif amount_col:
-            raw=str(r[amount_col]).replace(",","").strip()
-            if not raw or raw.lower()=="nan": continue
-            val=float(raw)
-            amt=abs(val); direction="Credit" if val>=0 else "Debit"
-        else: continue
+            val=_parse_amount(r[amount_col])
+            if pd.isna(val) or float(val)==0:
+                continue
+            amt=abs(float(val))
+            direction="Credit" if float(val)>=0 else "Debit"
+        else:
+            continue
+
         cat,cl=classify(desc)
         out.append([d.date().isoformat(),desc,amt,direction,cat,cl])
-    return pd.DataFrame(out,columns=["txn_date","description","amount","direction","category","class"])
+
+    return pd.DataFrame(
+        out,
+        columns=["txn_date","description","amount","direction","category","class"]
+    )
 
 def save_transactions(df, source="import"):
     added=0
@@ -365,15 +479,18 @@ with tabs[1]:
     f=st.file_uploader("Choose a statement",type=["csv","xlsx","xls"])
     if f:
         try:
-            raw=pd.read_csv(f) if f.name.lower().endswith(".csv") else pd.read_excel(f)
+            # Read without assuming the first row is the header. Some bank
+            # statements put a decorative/title row above the real headers.
+            raw=pd.read_csv(f,header=None) if f.name.lower().endswith(".csv") else pd.read_excel(f,header=None)
             norm=normalize_statement(raw)
-            st.write(f"Detected {len(norm)} transactions.")
+            st.success(f"Detected {len(norm)} transactions.")
             st.dataframe(norm.head(50),use_container_width=True,hide_index=True)
             if st.button("Import transactions",type="primary"):
                 n=save_transactions(norm,f.name)
                 st.success(f"Imported {n} new transactions. Duplicates were ignored.")
                 st.rerun()
-        except Exception as e: st.error(str(e))
+        except Exception as e:
+            st.error(str(e))
 
 # Learning
 with tabs[2]:

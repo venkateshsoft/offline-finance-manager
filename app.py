@@ -3,6 +3,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import sqlite3, hashlib, hmac, math, re
+from io import BytesIO
 from pathlib import Path
 from datetime import datetime, date, timedelta
 from dateutil.relativedelta import relativedelta

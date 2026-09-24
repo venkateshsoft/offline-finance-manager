@@ -167,56 +167,101 @@ def reset_all_financial_data():
     c.commit()
 
 # ---------------- Recurring-payment exclusions ----------------
-def recurring_exclusions_available():
-    """Return True when the optional recurring_exclusions table is available.
+def _fallback_exclusions():
+    """Session-only fallback used when the optional Supabase table is not available.
 
-    The feature is optional until the Supabase migration is applied. A missing
-    table must never prevent the rest of the Finance Manager from loading.
+    This keeps the app functional before the one-time migration is applied.
+    Once the migration exists, exclusions are persisted in Supabase.
     """
-    if not supabase_enabled():
-        return True
+    return st.session_state.setdefault("recurring_exclusions_fallback", {})
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _supabase_recurring_exclusions_available():
     try:
         get_supabase().table("recurring_exclusions").select("id").limit(1).execute()
         return True
     except Exception:
         return False
 
+def recurring_exclusions_available():
+    """Return whether persistent recurring exclusions are available.
+
+    A missing optional table must never crash the application.
+    """
+    if not supabase_enabled():
+        return True
+    return bool(_supabase_recurring_exclusions_available())
+
 def get_recurring_exclusions():
+    fallback=set(_fallback_exclusions().keys())
+    if not supabase_enabled():
+        return fallback
     if not recurring_exclusions_available():
-        return set()
+        return fallback
     try:
         rows=db_select("recurring_exclusions")
-        return {str(r.get("recurring_key")) for r in rows if r.get("recurring_key")}
+        return fallback | {str(r.get("recurring_key")) for r in rows if r.get("recurring_key")}
     except Exception:
-        return set()
+        return fallback
 
 def recurring_key(merchant_key, frequency, amount):
     return f"{str(merchant_key).strip().upper()}|{str(frequency).strip()}|{round(float(amount or 0))}"
 
 def exclude_recurring(rec_key):
-    if not recurring_exclusions_available():
-        raise RuntimeError(
-            "Recurring-payment exclusions are not enabled yet. Run the supplied "
-            "supabase_recurring_exclusions_migration.sql once in Supabase SQL Editor, "
-            "then reboot the Streamlit app."
-        )
-    payload={"recurring_key":str(rec_key),"created_at":datetime.now().isoformat()}
-    if supabase_enabled():
-        # Avoid a duplicate-key error if the user clicks delete twice.
-        existing=(get_supabase().table("recurring_exclusions").select("id")
-                  .eq("recurring_key",str(rec_key)).limit(1).execute().data)
-        if not existing:
-            get_supabase().table("recurring_exclusions").insert(payload).execute()
-    else:
+    """Exclude a recurring pattern without ever crashing the app.
+
+    If the Supabase migration is not present, the exclusion is applied to the
+    current Streamlit session and a non-fatal status is returned. If the table
+    exists, the exclusion is persisted and also mirrored in session state.
+    """
+    rec_key=str(rec_key)
+    fallback=_fallback_exclusions()
+    fallback[rec_key]={"recurring_key":rec_key,"created_at":datetime.now().isoformat()}
+
+    if not supabase_enabled():
         c=local_conn()
         c.execute("INSERT OR IGNORE INTO recurring_exclusions (recurring_key,created_at) VALUES (?,?)",
-                  (payload["recurring_key"],payload["created_at"]))
+                  (rec_key,datetime.now().isoformat()))
         c.commit()
+        return True, "saved locally"
 
-def restore_recurring(rec_id):
     if not recurring_exclusions_available():
-        raise RuntimeError("Recurring-payment exclusions table is not available. Run the Supabase migration first.")
-    db_delete("recurring_exclusions",int(rec_id))
+        return False, "session only"
+
+    try:
+        existing=(get_supabase().table("recurring_exclusions").select("id")
+                  .eq("recurring_key",rec_key).limit(1).execute().data)
+        if not existing:
+            get_supabase().table("recurring_exclusions").insert({
+                "recurring_key":rec_key,
+                "created_at":datetime.now().isoformat()
+            }).execute()
+        return True, "saved"
+    except Exception:
+        # Preserve the session exclusion even if the optional table becomes
+        # temporarily unavailable. The rest of the app remains usable.
+        return False, "session only"
+
+def restore_recurring(rec_id=None, rec_key_value=None):
+    """Restore an excluded recurring pattern safely."""
+    if rec_key_value:
+        _fallback_exclusions().pop(str(rec_key_value),None)
+    if not supabase_enabled():
+        if rec_id is not None:
+            db_delete("recurring_exclusions",int(rec_id))
+        return True
+    # If the migration is missing, the session fallback has already been
+    # removed above, so restoring is still successful for this session.
+    if not recurring_exclusions_available():
+        return True
+    try:
+        if rec_id is not None:
+            db_delete("recurring_exclusions",int(rec_id))
+        elif rec_key_value:
+            get_supabase().table("recurring_exclusions").delete().eq("recurring_key",str(rec_key_value)).execute()
+        return True
+    except Exception:
+        return False
 
 def is_emi_transaction(row):
     cls=str(row.get("class","")).upper()
@@ -976,26 +1021,44 @@ with tabs[3]:
         ridx=st.selectbox("Recurring payment to remove",rec_options,
                           format_func=lambda i:f"{rec.loc[i,'Merchant / Description']} | {rec.loc[i,'Frequency']} | ₹{rec.loc[i,'Typical Amount']:,.0f} | {rec.loc[i,'Type']}")
         if st.button("🗑️ Remove selected recurring payment",type="secondary"):
-            exclude_recurring(rec.loc[ridx,"_recurring_key"])
-            st.success("Recurring payment removed. Its transactions were not deleted, and it will no longer be included in Runway EMI commitments.")
-            st.rerun()
+            try:
+                ok, mode = exclude_recurring(rec.loc[ridx,"_recurring_key"])
+                if ok:
+                    st.success("Recurring payment removed. Its transactions were not deleted, and it will no longer be included in Runway EMI commitments.")
+                else:
+                    st.warning("Recurring payment removed for this session. To keep the exclusion after reboot, run the one-time Supabase recurring_exclusions migration.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Could not remove the recurring payment: {e}")
 
     # Show excluded patterns so the user can restore a mistakenly removed EMI.
     excluded_df=pd.DataFrame()
-    if recurring_exclusions_available():
-        try:
+    try:
+        if recurring_exclusions_available():
             excluded_rows=db_select("recurring_exclusions")
             excluded_df=pd.DataFrame(excluded_rows) if excluded_rows else pd.DataFrame()
-        except Exception:
-            excluded_df=pd.DataFrame()
-    elif supabase_enabled():
-        st.info("Recurring-payment removal is ready, but the Supabase migration has not been applied yet. Run the supplied `supabase_recurring_exclusions_migration.sql` once in Supabase SQL Editor.")
+        else:
+            fallback_rows=list(_fallback_exclusions().values())
+            excluded_df=pd.DataFrame(fallback_rows) if fallback_rows else pd.DataFrame()
+            if supabase_enabled():
+                st.info("Recurring-payment removal is working for this session. Run the one-time `supabase_recurring_exclusions_migration.sql` to persist exclusions across reboots.")
+    except Exception:
+        fallback_rows=list(_fallback_exclusions().values())
+        excluded_df=pd.DataFrame(fallback_rows) if fallback_rows else pd.DataFrame()
     if not excluded_df.empty:
         with st.expander("↩️ Restore removed recurring payments"):
+            if "id" not in excluded_df.columns:
+                excluded_df["id"] = range(-1, -len(excluded_df)-1, -1)
             exid=st.selectbox("Removed recurring pattern",excluded_df.id.tolist(),
                               format_func=lambda x:excluded_df.loc[excluded_df.id==x,"recurring_key"].iloc[0])
             if st.button("Restore selected recurring payment"):
-                restore_recurring(int(exid)); st.rerun()
+                selected_key=str(excluded_df.loc[excluded_df.id==exid,"recurring_key"].iloc[0])
+                real_id=None if int(exid)<0 else int(exid)
+                if restore_recurring(real_id, selected_key):
+                    st.success("Recurring payment restored.")
+                    st.rerun()
+                else:
+                    st.error("Could not restore the recurring payment. Please check the Supabase migration and try again.")
 
 # Loans
 with tabs[4]:
@@ -1019,15 +1082,21 @@ with tabs[4]:
             extra=st.number_input("Optional extra principal/month",min_value=0.0,value=float(l.extra_payment or 0),step=1000.0)
             save_edit=st.form_submit_button("💾 Update loan",type="primary")
         if save_edit:
-            pay=known_emi if known_emi else emi_payment(principal,rate,tenure)
-            db_update("loans",int(lid),{"name":name,"lender":lender,"principal":principal,"annual_rate":rate,
-                                      "emi":pay,"start_date":str(start),"tenure_months":int(tenure),"extra_payment":extra})
-            st.success("Loan updated successfully.")
-            st.rerun()
+            try:
+                pay=known_emi if known_emi else emi_payment(principal,rate,tenure)
+                db_update("loans",int(lid),{"name":name,"lender":lender,"principal":principal,"annual_rate":rate,
+                                          "emi":pay,"start_date":str(start),"tenure_months":int(tenure),"extra_payment":extra})
+                st.success("Loan updated successfully.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Could not update the loan: {e}")
         if st.button("🗑️ Delete selected loan",key=f"delete_loan_{int(lid)}"):
-            db_delete("loans",int(lid))
-            st.success("Loan deleted. Related transactions were not deleted.")
-            st.rerun()
+            try:
+                db_delete("loans",int(lid))
+                st.success("Loan deleted. Related transactions were not deleted.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Could not delete the loan: {e}")
 
         loans=get_loans()
         l=loans[loans.id==lid].iloc[0] if not loans.empty and int(lid) in loans.id.tolist() else None

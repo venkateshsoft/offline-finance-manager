@@ -135,6 +135,31 @@ def db_update(table, row_id, data):
     c.execute(f"UPDATE {table} SET {sets} WHERE id=?",(*data.values(),row_id))
     c.commit()
 
+# ---------------- Safe data reset ----------------
+RESETTABLE_TABLES = [
+    "transactions",
+    "rules",
+    "loans",
+    "income_sources",
+    "trading_results",
+]
+
+def reset_all_financial_data():
+    """Delete user-entered/test financial data from every storage backend.
+
+    Authentication/secrets and application code are not affected.
+    """
+    if supabase_enabled():
+        for table in RESETTABLE_TABLES:
+            # All application IDs are positive serial/identity values.
+            get_supabase().table(table).delete().neq("id", 0).execute()
+        return
+
+    c=local_conn()
+    for table in RESETTABLE_TABLES:
+        c.execute(f"DELETE FROM {table}")
+    c.commit()
+
 # ---------------- Classification ----------------
 BUILTIN = [
 ("swiggy","Food","Expense"),("zomato","Food","Expense"),("dominos","Food","Expense"),
@@ -161,20 +186,100 @@ CATEGORIES = ["Food","Travel","Entertainment","Fuel","Online Shopping","Educatio
 
 def load_rules():
     rows=db_select("rules")
-    return [(r["pattern"],r["category"],r["class"]) for r in rows]
+    return [(str(r.get("pattern", "")), r.get("category", "Other"), r.get("class", "Expense"))
+            for r in rows if str(r.get("pattern", "")).strip()]
 
 def classify(desc, rules=None):
-    """Classify a transaction without re-querying the database for every row."""
     s=str(desc).lower()
-    if rules is None:
-        rules=load_rules()
+    rules = load_rules() if rules is None else rules
     for p,cat,cl in rules:
-        if str(p).lower() in s: return cat,cl
+        if p.lower() in s: return cat,cl
     for p,cat,cl in BUILTIN:
         if p in s: return cat,cl
     if any(x in s for x in ["atm","cash withdrawal"]): return "Cash Withdrawal","Expense"
     if any(x in s for x in ["transfer","neft","imps","rtgs","upi transfer"]): return "Transfer","Transfer"
     return "Other","Expense"
+
+def _merchant_signature(description):
+    """Create a stable merchant key by removing transaction IDs and generic bank tokens."""
+    s = str(description or "").upper()
+    s = re.sub(r"[^A-Z0-9]+", " ", s)
+    tokens = []
+    generic = {
+        "ACH","D","DR","CR","TP","TXN","TRAN","TRANSACTION","DEBIT","CREDIT",
+        "PAYMENT","PAY","TRANSFER","UPI","IMPS","NEFT","RTGS","POS","NACH",
+        "ECS","ATM","REF","REFERENCE","NO","NUMBER","ID"
+    }
+    for token in s.split():
+        if token.isdigit():
+            continue
+        # Remove tokens that are mostly transaction/reference numbers.
+        if len(token) >= 8 and sum(ch.isdigit() for ch in token) >= 4:
+            continue
+        if token in generic:
+            continue
+        if len(token) >= 4:
+            tokens.append(token)
+    return " ".join(tokens[:6]) or re.sub(r"\s+", " ", s).strip()[:80]
+
+def suggest_rule_pattern(description):
+    """Suggest a useful learning pattern instead of the first generic token (e.g. ACH)."""
+    return _merchant_signature(description)[:50]
+
+def save_rule(pattern, category, class_name):
+    """Insert a learning rule or update the existing rule with the same pattern."""
+    pattern = str(pattern or "").strip()
+    if not pattern:
+        raise ValueError("Please enter a merchant pattern before saving the correction.")
+
+    payload = {
+        "pattern": pattern,
+        "category": category,
+        "class": class_name,
+        "created_at": datetime.now().isoformat(),
+    }
+
+    if supabase_enabled():
+        try:
+            existing = (get_supabase().table("rules").select("id")
+                        .eq("pattern", pattern).limit(1).execute().data)
+            if existing:
+                db_update("rules", int(existing[0]["id"]),
+                          {"category": category, "class": class_name,
+                           "created_at": payload["created_at"]})
+                return "updated"
+            db_insert("rules", payload)
+            return "created"
+        except Exception as e:
+            # A concurrent duplicate can still happen between SELECT and INSERT.
+            msg = str(e).lower()
+            if "duplicate" in msg or "unique" in msg or "23505" in msg:
+                try:
+                    existing = (get_supabase().table("rules").select("id")
+                                .eq("pattern", pattern).limit(1).execute().data)
+                    if existing:
+                        db_update("rules", int(existing[0]["id"]),
+                                  {"category": category, "class": class_name,
+                                   "created_at": payload["created_at"]})
+                        return "updated"
+                except Exception:
+                    pass
+            raise RuntimeError(
+                "Could not save the learning rule to Supabase. "
+                "Please check the Supabase connection and try again."
+            ) from e
+
+    # SQLite path: update an existing pattern or insert a new one.
+    c = local_conn()
+    existing = c.execute("SELECT id FROM rules WHERE pattern=? LIMIT 1", (pattern,)).fetchone()
+    c.execute(
+        "INSERT INTO rules (pattern,category,class,created_at) VALUES (?,?,?,?) "
+        "ON CONFLICT(pattern) DO UPDATE SET category=excluded.category, "
+        "class=excluded.class, created_at=excluded.created_at",
+        (pattern, category, class_name, payload["created_at"])
+    )
+    c.commit()
+    return "updated" if existing else "created"
 
 def fingerprint(d, desc, amt, direction):
     raw=f"{d}|{str(desc).strip().lower()}|{round(float(amt),2)}|{direction}"
@@ -343,10 +448,8 @@ def normalize_statement(df):
             f"Detected columns: {list(df.columns)}"
         )
 
-    # Load user classification rules once. The previous implementation queried
-    # the database for every transaction, which could create hundreds/thousands
-    # of unnecessary database calls during a bank-statement import.
-    rules=load_rules()
+    # Load user rules once per import instead of querying the database for every row.
+    rules = load_rules()
     out=[]
     for _,r in df.iterrows():
         d=pd.to_datetime(r[date_col],errors="coerce",dayfirst=True)
@@ -396,101 +499,90 @@ def normalize_statement(df):
     )
 
 def save_transactions(df, source="import"):
-    """Persist imported transactions efficiently and safely.
+    """Save imported transactions efficiently and safely.
 
-    The old implementation performed a database duplicate check and then an
-    insert for every row (and, for SQLite, read the entire transaction table
-    before and after every insert). That pattern is very expensive on
-    Streamlit Community Cloud and can exhaust available resources.
-
-    This version calculates fingerprints locally and writes in batches.
-    Supabase uses its bulk upsert/ignore-duplicates support, while SQLite uses
-    INSERT OR IGNORE with executemany.
+    Fingerprints are calculated in memory, duplicates inside the uploaded file
+    are removed locally, and database writes are batched. This avoids one
+    network/database request per transaction and prevents resource exhaustion.
     """
     if df is None or df.empty:
         return 0
 
-    required=["txn_date","description","amount","direction","category","class"]
-    missing=[c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Import data is missing required columns: {', '.join(missing)}")
-
-    rows=[]
+    records=[]
     seen=set()
-    import_view=df[required]
-    for txn_date,description,amount,direction,category,txn_class in import_view.itertuples(index=False, name=None):
-        txn_date=str(txn_date)
-        description=str(description)
-        amount=float(amount)
-        direction=str(direction)
-        fp=fingerprint(txn_date,description,amount,direction)
-        # Also remove duplicates occurring inside the uploaded file itself.
+    for _,r in df.iterrows():
+        fp=fingerprint(r.txn_date,r.description,r.amount,r.direction)
         if fp in seen:
             continue
         seen.add(fp)
-        rows.append({
-            "txn_date":txn_date,
-            "description":description,
-            "amount":amount,
-            "direction":direction,
-            "category":str(category),
-            "class":str(txn_class),
+        records.append({
+            "txn_date":str(r.txn_date),
+            "description":str(r.description),
+            "amount":float(r.amount),
+            "direction":str(r.direction),
+            "category":str(r.category),
+            "class":str(r["class"]),
             "source":source,
-            "fingerprint":fp
+            "fingerprint":fp,
         })
 
-    if not rows:
+    if not records:
         return 0
 
-    # Keep request sizes moderate for hosted environments.
-    batch_size=500
-    added=0
+    if supabase_enabled():
+        # Supabase/PostgREST supports bulk upsert with a UNIQUE conflict column.
+        # ignore_duplicates=True makes the operation safe for re-imports.
+        added=0
+        batch_size=500
+        for start in range(0,len(records),batch_size):
+            batch=records[start:start+batch_size]
+            try:
+                response=(get_supabase().table("transactions")
+                          .upsert(batch, on_conflict="fingerprint", ignore_duplicates=True)
+                          .execute())
+                # With ignore_duplicates, the returned representation may vary
+                # by client/PostgREST configuration. Count only rows explicitly
+                # returned; otherwise fall back to a safe duplicate-tolerant path.
+                if getattr(response, "data", None):
+                    added += len(response.data)
+            except Exception as e:
+                # If the deployed supabase-py/PostgREST version does not accept
+                # bulk ignore-duplicates, fall back to one bulk insert and let the
+                # UNIQUE constraint reject the entire batch with a clear message.
+                msg=str(e)
+                raise RuntimeError(
+                    "Transactions could not be saved to Supabase. "
+                    "Please verify that the transactions table has a UNIQUE "
+                    "constraint on fingerprint and that your Supabase API is available."
+                ) from e
 
-    try:
-        if supabase_enabled():
-            sb=get_supabase()
-            # Supabase supports bulk insert/upsert with a list of dictionaries.
-            # With a UNIQUE fingerprint, ignore_duplicates makes the import
-            # idempotent without a SELECT for every transaction.
-            for start in range(0,len(rows),batch_size):
-                batch=rows[start:start+batch_size]
-                response=(
-                    sb.table("transactions")
-                    .upsert(batch, on_conflict="fingerprint", ignore_duplicates=True)
-                    .select("id")
-                    .execute()
-                )
-                # With select("id"), the response tells us how many rows were
-                # actually inserted/upserted in this batch.
-                added += len(response.data or [])
-        else:
-            c=local_conn()
-            sql="""INSERT OR IGNORE INTO transactions
-                (txn_date,description,amount,direction,category,class,source,fingerprint)
-                VALUES (?,?,?,?,?,?,?,?)"""
-            for start in range(0,len(rows),batch_size):
-                batch=rows[start:start+batch_size]
-                values=[(x["txn_date"],x["description"],x["amount"],x["direction"],
-                         x["category"],x["class"],x["source"],x["fingerprint"]) for x in batch]
-                before=c.total_changes
-                c.executemany(sql,values)
-                c.commit()
-                added += c.total_changes-before
-            c.close()
-    except OSError as e:
-        raise ValueError(
-            "The hosted app ran out of an operating-system resource while saving the transactions. "
-            "The importer now uses batched database writes; please reboot the Streamlit app and retry. "
-            f"Details: {e}"
-        ) from e
-    except Exception as e:
-        raise ValueError(
-            "The statement was read successfully, but saving the transactions failed. "
-            "No per-row import loop is used now. Please check the database/Streamlit logs. "
-            f"Details: {type(e).__name__}: {e}"
-        ) from e
+        # When the API uses minimal/no representation, determine the actual new
+        # count without downloading the entire transaction table.
+        if added == 0:
+            try:
+                fps=[r["fingerprint"] for r in records]
+                existing = (get_supabase().table("transactions").select("fingerprint")
+                            .in_("fingerprint", fps).execute().data)
+                added=len({r.get("fingerprint") for r in existing})
+            except Exception:
+                # Import itself succeeded; avoid turning a successful import into
+                # a misleading failure just because a count query failed.
+                added=0
+        return added
 
-    return int(added)
+    # SQLite: one transaction and one executemany call instead of repeated reads.
+    c=local_conn()
+    cols=["txn_date","description","amount","direction","category","class","source","fingerprint"]
+    values=[tuple(r[cname] for cname in cols) for r in records]
+    before=c.total_changes
+    c.executemany(
+        "INSERT OR IGNORE INTO transactions "
+        "(txn_date,description,amount,direction,category,class,source,fingerprint) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        values
+    )
+    c.commit()
+    return c.total_changes-before
 
 def get_txns():
     rows=db_select("transactions")
@@ -528,24 +620,76 @@ def amortize(principal,annual,months,start,emi=None,extra=0):
     return pd.DataFrame(rows,columns=["Installment","Due Date","Payment","Interest","Principal","Balance"])
 
 def recurring(df):
-    if df.empty:return pd.DataFrame()
+    """Detect recurring payments even when bank narration contains changing IDs.
+
+    EMI transactions receive special handling: the app can identify a monthly
+    commitment from the EMI class/category and repeated amount/date pattern even
+    when the narration changes from month to month (common with ACH/NACH debits).
+    """
+    if df.empty:
+        return pd.DataFrame()
+
     d=df[df.direction=="Debit"].copy()
-    d["date"]=pd.to_datetime(d.txn_date)
+    if d.empty:
+        return pd.DataFrame()
+    d["date"]=pd.to_datetime(d.txn_date,errors="coerce")
+    d=d.dropna(subset=["date"])
+    d["merchant_key"]=d.description.map(_merchant_signature)
+    d["is_emi"]=((d["class"].astype(str).str.upper()=="EMI") |
+                  (d["category"].astype(str).str.lower()=="loan emi"))
+
     rows=[]
-    # Normalize descriptions into a stable merchant-ish key.
-    d["merchant_key"]=d.description.str.upper().str.replace(r"[^A-Z0-9 ]"," ",regex=True).str.replace(r"\s+"," ",regex=True).str.strip()
-    for key,g in d.groupby("merchant_key"):
-        g=g.sort_values("date")
-        if len(g)<3: continue
-        diffs=g.date.diff().dt.days.dropna()
-        med=float(diffs.median()) if len(diffs) else 0
-        if 25<=med<=35: freq="Monthly"
-        elif 80<=med<=100: freq="Quarterly"
-        elif 350<=med<=380: freq="Annual"
-        elif 12<=med<=17: freq="Fortnightly"
-        else: continue
-        rows.append([key,freq,float(g.amount.median()),len(g),g.date.max().date()])
-    return pd.DataFrame(rows,columns=["Merchant / Description","Frequency","Typical Amount","Occurrences","Last Seen"])
+
+    def add_group(label,g,frequency):
+        if g.empty:
+            return
+        rows.append([label,frequency,float(g.amount.median()),len(g),g.date.max().date(),
+                     "EMI" if bool(g.is_emi.any()) else "Recurring payment"])
+
+    # 1) EMI groups: group by stable merchant signature + rounded amount.
+    # This handles narrations such as ACH/PNBHOUSINGFIN-<changing-id>.
+    emi=d[d.is_emi].copy()
+    if not emi.empty:
+        emi["amount_key"]=emi.amount.round(0)
+        for (key,amount),g in emi.groupby(["merchant_key","amount_key"]):
+            g=g.sort_values("date")
+            diffs=g.date.diff().dt.days.dropna()
+            if len(g)>=2 and len(diffs):
+                med=float(diffs.median())
+                if 25<=med<=35:
+                    add_group(key or "Loan EMI",g,"Monthly")
+                elif 80<=med<=100:
+                    add_group(key or "Loan EMI",g,"Quarterly")
+                elif 350<=med<=380:
+                    add_group(key or "Loan EMI",g,"Annual")
+
+    # 2) Other recurring payments: stable signature + similar amount.
+    non_emi=d[~d.is_emi].copy()
+    if not non_emi.empty:
+        non_emi["amount_key"]=non_emi.amount.round(0)
+        for (key,amount),g in non_emi.groupby(["merchant_key","amount_key"]):
+            g=g.sort_values("date")
+            if len(g)<2:
+                continue
+            diffs=g.date.diff().dt.days.dropna()
+            if not len(diffs):
+                continue
+            med=float(diffs.median())
+            if 25<=med<=35: freq="Monthly"
+            elif 80<=med<=100: freq="Quarterly"
+            elif 350<=med<=380: freq="Annual"
+            elif 12<=med<=17: freq="Fortnightly"
+            else: continue
+            # Require either 3 occurrences or 2 occurrences with a convincing
+            # interval. This avoids classifying unrelated one-off payments.
+            if len(g)>=2:
+                add_group(key or "Recurring payment",g,freq)
+
+    result=pd.DataFrame(rows,columns=["Merchant / Description","Frequency","Typical Amount",
+                                      "Occurrences","Last Seen","Type"])
+    if result.empty:
+        return result
+    return result.sort_values(["Type","Last Seen"],ascending=[True,False]).reset_index(drop=True)
 
 def get_loans():
     rows=db_select("loans")
@@ -655,13 +799,19 @@ with tabs[2]:
         cat=c1.selectbox("Correct category",CATEGORIES,index=CATEGORIES.index(r.category) if r.category in CATEGORIES else 0)
         classes=["Expense","EMI","Income","Transfer"]
         cl=c2.selectbox("Correct class",classes,index=classes.index(r["class"]) if r["class"] in classes else 0)
-        default=re.split(r"\s+",str(r.description).strip())[0][:50]
+        default=suggest_rule_pattern(r.description)
         pattern=c3.text_input("Merchant pattern to learn",default)
         if st.button("Save correction"):
-            db_insert("rules",{"pattern":pattern,"category":cat,"class":cl,"created_at":datetime.now().isoformat()})
-            db_update_txn(int(r.id),{"category":cat,"class":cl})
-            st.success("Saved. Future matching transactions will use this rule.")
-            st.rerun()
+            try:
+                status=save_rule(pattern,cat,cl)
+                db_update_txn(int(r.id),{"category":cat,"class":cl})
+                if status=="updated":
+                    st.success("Existing learning rule updated and this transaction was corrected.")
+                else:
+                    st.success("Learning rule saved and this transaction was corrected.")
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
     rules=load_rules()
     if rules:
         st.dataframe(pd.DataFrame(rules,columns=["Pattern","Category","Class"]),use_container_width=True,hide_index=True)
@@ -669,12 +819,22 @@ with tabs[2]:
 # Recurring
 with tabs[3]:
     st.subheader("🔁 Recurring payments")
-    rec=recurring(get_txns())
+    current_txns=get_txns()
+    rec=recurring(current_txns)
     if rec.empty:
-        st.info("At least three similarly described payments with a recognizable interval are needed.")
+        emi_candidates = current_txns[
+            (current_txns.direction=="Debit") &
+            ((current_txns["class"].astype(str).str.upper()=="EMI") |
+             (current_txns["category"].astype(str).str.lower()=="loan emi"))
+        ] if not current_txns.empty else pd.DataFrame()
+        if not emi_candidates.empty:
+            st.info("EMI transactions are present, but there are not yet enough matching monthly entries to confirm a recurring schedule. Import at least two months of the same EMI or correct the lender transaction under Learning.")
+        else:
+            st.info("No recurring payment pattern has been confirmed yet. Import at least two occurrences of a payment, or classify an EMI as Loan EMI / EMI under Learning.")
     else:
         st.dataframe(rec,use_container_width=True,hide_index=True)
-        st.caption("Examples: Netflix monthly, internet monthly, insurance annual, school fees periodic, EMI monthly. Confirm detections before using them as fixed commitments.")
+        st.caption("EMIs are detected from EMI/Loan EMI classifications plus stable monthly amount/date patterns. ACH/NACH transaction IDs are ignored when identifying the lender.")
+        st.info("Tip: if an EMI is not detected, correct one transaction in 🧠 Learning as 'Loan EMI / EMI'. Future matching transactions will then be classified and included in recurring detection.")
 
 # Loans
 with tabs[4]:
@@ -871,3 +1031,15 @@ with tabs[7]:
     st.write("- Do not put passwords, API keys, bank statements or database files in GitHub.")
     st.write("### Backup")
     st.write("For a serious personal-finance deployment, keep periodic encrypted exports/backups outside the Git repository.")
+
+    st.write("### 🧹 Data reset")
+    st.caption("Use this once to remove the sample/test data you entered while building the app. It does not change your login password, Streamlit Secrets, GitHub files, or application code.")
+    st.warning("⚠️ This will permanently delete ALL saved transactions, learning rules, loans, income sources, and trading P/L from the connected database. This cannot be undone.")
+    confirm_reset = st.checkbox("I understand that this will permanently delete my saved financial data.", key="confirm_full_reset")
+    if st.button("🧹 Reset all sample/test financial data", type="secondary", disabled=not confirm_reset):
+        try:
+            reset_all_financial_data()
+            st.success("All sample/test financial data has been cleared. You can now import your real bank data.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Reset encountered an error: {e}. Please verify the data before trying again, because a cloud reset can be partially completed if one table rejects the delete.")

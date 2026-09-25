@@ -244,7 +244,11 @@ def save_selected_emi_commitments(recurring_df, selected_indices):
             continue
         r=recurring_df.loc[idx]
         key=str(r.get("Recurring Key", "")).strip()
-        if not key or str(r.get("Frequency", "")) != "Monthly":
+        # Only an explicitly detected EMI can ever become a mandatory EMI
+        # commitment. This prevents stale/non-EMI recurring keys from being
+        # persisted and later inflating the Runway total.
+        if (not key or str(r.get("Frequency", "")) != "Monthly"
+                or str(r.get("Type", "")) != "EMI"):
             continue
         keys.add(key)
         payload.append({
@@ -291,11 +295,29 @@ def save_selected_emi_commitments(recurring_df, selected_indices):
     return len(keys)
 
 def selected_emi_amount(recurring_df):
+    """Return ONLY the exact saved mandatory monthly EMI total.
+
+    Never include a non-EMI recurring row, stale commitment, quarterly/annual
+    row, or any amount that is not represented by a currently detected monthly
+    EMI. The recurring checklist is the single source of truth.
+    """
     selected=get_selected_emi_keys()
-    if recurring_df is None or recurring_df.empty:
+    if recurring_df is None or recurring_df.empty or not selected:
         return 0.0
-    x=recurring_df[recurring_df["Recurring Key"].isin(selected)]
-    return float(x[x["Frequency"]=="Monthly"]["Typical Amount"].sum()) if not x.empty else 0.0
+    x=recurring_df.copy()
+    required={"Recurring Key","Frequency","Type","Typical Amount"}
+    if not required.issubset(set(x.columns)):
+        return 0.0
+    x=x[
+        x["Recurring Key"].astype(str).isin(selected)
+        & x["Frequency"].astype(str).str.upper().eq("MONTHLY")
+        & x["Type"].astype(str).str.upper().eq("EMI")
+    ].copy()
+    if x.empty:
+        return 0.0
+    # One row per recurring key; guard against accidental duplicate detection.
+    x=x.drop_duplicates(subset=["Recurring Key"],keep="last")
+    return float(pd.to_numeric(x["Typical Amount"],errors="coerce").fillna(0).sum())
 
 # ---------------- Safe data reset ----------------
 RESETTABLE_TABLES = [
@@ -1165,6 +1187,11 @@ with tabs[3]:
         # Explicit mandatory EMI selection for Runway.
         emi_rec=rec[(rec["Type"]=="EMI") & (rec["Frequency"]=="Monthly")].copy()
         selected_keys=get_selected_emi_keys()
+        # Reconcile any legacy/stale saved keys against the current EMI checklist.
+        # Only currently detected monthly EMI keys are allowed to remain selected.
+        valid_emi_keys=set(emi_rec["Recurring Key"].astype(str)) if not emi_rec.empty else set()
+        selected_keys=selected_keys & valid_emi_keys
+        st.session_state["selected_emi_commitments"]=set(selected_keys)
         if not emi_rec.empty:
             st.markdown("### ☑️ Select mandatory monthly EMIs for Runway")
             st.caption("Tick only the EMIs you must pay every month. Other recurring payments can remain unchecked and will not be included in Monthly EMI commitments.")

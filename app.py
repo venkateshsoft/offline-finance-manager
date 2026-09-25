@@ -86,6 +86,9 @@ def local_conn():
     c.execute("""CREATE TABLE IF NOT EXISTS recurring_exclusions(
         id INTEGER PRIMARY KEY AUTOINCREMENT, recurring_key TEXT UNIQUE,
         created_at TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS emi_commitments(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, recurring_key TEXT UNIQUE,
+        merchant TEXT, frequency TEXT, amount REAL, created_at TEXT)""")
     c.commit()
     return c
 
@@ -201,6 +204,81 @@ def restore_recurring(recurring_key):
         except Exception:
             pass
 
+# ---------------- Explicit Runway EMI commitments ----------------
+def get_selected_emi_keys():
+    """Return recurring-payment keys explicitly selected as mandatory EMIs.
+
+    Session state keeps the feature usable even before the optional Supabase
+    migration is applied; when the table exists, selections persist across restarts.
+    """
+    selected=st.session_state.setdefault("selected_emi_commitments", set())
+    if supabase_enabled():
+        try:
+            rows=(get_supabase().table("emi_commitments").select("recurring_key").execute().data or [])
+            selected.update(str(r["recurring_key"]) for r in rows if r.get("recurring_key"))
+        except Exception:
+            pass
+    else:
+        try:
+            rows=db_select("emi_commitments")
+            selected.update(str(r["recurring_key"]) for r in rows if r.get("recurring_key"))
+        except Exception:
+            pass
+    return selected
+
+def save_selected_emi_commitments(recurring_df, selected_indices):
+    """Persist exactly the checked recurring EMI rows as mandatory Runway commitments."""
+    keys=set()
+    payload=[]
+    for idx in selected_indices:
+        if idx not in recurring_df.index:
+            continue
+        r=recurring_df.loc[idx]
+        key=str(r.get("Recurring Key", "")).strip()
+        if not key:
+            continue
+        keys.add(key)
+        payload.append({
+            "recurring_key":key,
+            "merchant":str(r.get("Merchant / Description", "")),
+            "frequency":str(r.get("Frequency", "")),
+            "amount":float(r.get("Typical Amount", 0) or 0),
+            "created_at":datetime.now().isoformat(),
+        })
+
+    st.session_state["selected_emi_commitments"]=keys
+    if supabase_enabled():
+        try:
+            existing=(get_supabase().table("emi_commitments").select("id,recurring_key").execute().data or [])
+            existing_keys={str(r.get("recurring_key")):int(r["id"]) for r in existing if r.get("recurring_key")}
+            for row in payload:
+                if row["recurring_key"] in existing_keys:
+                    get_supabase().table("emi_commitments").update({k:v for k,v in row.items() if k!="created_at"}).eq("id",existing_keys[row["recurring_key"]]).execute()
+                else:
+                    get_supabase().table("emi_commitments").insert(row).execute()
+            for key,rid in existing_keys.items():
+                if key not in keys:
+                    get_supabase().table("emi_commitments").delete().eq("id",rid).execute()
+        except Exception:
+            pass
+    else:
+        try:
+            c=local_conn()
+            c.execute("DELETE FROM emi_commitments")
+            c.executemany("INSERT OR REPLACE INTO emi_commitments(recurring_key,merchant,frequency,amount,created_at) VALUES (?,?,?,?,?)",
+                          [(x["recurring_key"],x["merchant"],x["frequency"],x["amount"],x["created_at"]) for x in payload])
+            c.commit()
+        except Exception:
+            pass
+    return len(keys)
+
+def selected_emi_amount(recurring_df):
+    selected=get_selected_emi_keys()
+    if recurring_df is None or recurring_df.empty:
+        return 0.0
+    x=recurring_df[recurring_df["Recurring Key"].isin(selected)]
+    return float(x[x["Frequency"]=="Monthly"]["Typical Amount"].sum()) if not x.empty else 0.0
+
 # ---------------- Safe data reset ----------------
 RESETTABLE_TABLES = [
     "transactions",
@@ -209,6 +287,7 @@ RESETTABLE_TABLES = [
     "income_sources",
     "trading_results",
     "recurring_exclusions",
+    "emi_commitments",
 ]
 
 def reset_all_financial_data():
@@ -217,15 +296,28 @@ def reset_all_financial_data():
     Authentication/secrets and application code are not affected.
     """
     if supabase_enabled():
+        failures=[]
         for table in RESETTABLE_TABLES:
-            # All application IDs are positive serial/identity values.
-            get_supabase().table(table).delete().neq("id", 0).execute()
-        return
+            try:
+                # Delete rows through PostgREST. Optional tables may not yet have
+                # the required grants; report that table specifically instead of
+                # crashing after other data has been removed.
+                get_supabase().table(table).delete().neq("id", 0).execute()
+            except Exception as e:
+                failures.append((table,str(e)))
+        st.session_state["recurring_exclusions"]=set()
+        st.session_state["selected_emi_commitments"]=set()
+        return failures
 
     c=local_conn()
+    failures=[]
     for table in RESETTABLE_TABLES:
-        c.execute(f"DELETE FROM {table}")
+        try:
+            c.execute(f"DELETE FROM {table}")
+        except Exception as e:
+            failures.append((table,str(e)))
     c.commit()
+    return failures
 
 # ---------------- Classification ----------------
 BUILTIN = [
@@ -801,7 +893,12 @@ def recurring(df, apply_exclusions=True):
         for (key,amount),g in emi.groupby(["merchant_key","amount_key"]):
             g=g.sort_values("date")
             diffs=g.date.diff().dt.days.dropna()
-            if len(g)>=2 and len(diffs):
+            if len(g)==1:
+                # A transaction explicitly classified as EMI is a valid candidate
+                # even with only one historical occurrence. This lets users select
+                # a newly corrected NAVI/HDFC/PNB loan under the EMI checklist.
+                add_group(key or "Loan EMI",g,"Monthly")
+            elif len(diffs):
                 med=float(diffs.median())
                 if 25<=med<=35:
                     add_group(key or "Loan EMI",g,"Monthly")
@@ -974,6 +1071,7 @@ with tabs[2]:
 # Recurring
 with tabs[3]:
     st.subheader("🔁 Recurring payments")
+    st.caption("Choose exactly which recurring EMI payments are mandatory. Only the checked monthly EMI rows are included in Runway.")
     current_txns=get_txns()
     rec=recurring(current_txns)
     if rec.empty:
@@ -983,39 +1081,78 @@ with tabs[3]:
              (current_txns["category"].astype(str).str.lower()=="loan emi"))
         ] if not current_txns.empty else pd.DataFrame()
         if not emi_candidates.empty:
-            st.info("EMI transactions are present, but there are not yet enough matching monthly entries to confirm a recurring schedule. Import at least two months of the same EMI or correct the lender transaction under Learning.")
+            st.info("EMI transactions are present. Correct the lender transaction as Loan EMI / EMI under Learning and it will appear here as a selectable monthly EMI candidate.")
         else:
-            st.info("No recurring payment pattern has been confirmed yet. Import at least two occurrences of a payment, or classify an EMI as Loan EMI / EMI under Learning.")
+            st.info("No recurring payments are currently detected. Import more history or classify an EMI under Learning.")
     else:
         display_cols=["Merchant / Description","Frequency","Typical Amount","Occurrences","Last Seen","Type"]
         st.dataframe(rec[display_cols],use_container_width=True,hide_index=True)
-        st.caption("Remove a recurring item to exclude it from the Runway EMI/commitment calculation. This does not delete the underlying bank transactions.")
+
+        # Explicit mandatory EMI selection for Runway.
+        emi_rec=rec[(rec["Type"]=="EMI") & (rec["Frequency"]=="Monthly")].copy()
+        selected_keys=get_selected_emi_keys()
+        if not emi_rec.empty:
+            st.markdown("### ☑️ Select mandatory monthly EMIs for Runway")
+            st.caption("Tick only the EMIs you must pay every month. Other recurring payments can remain unchecked and will not be included in Monthly EMI commitments.")
+            checked_indices=[]
+            for ridx,row in emi_rec.iterrows():
+                key=str(row["Recurring Key"])
+                checked=key in selected_keys
+                if st.checkbox(f"{row['Merchant / Description']} — ₹{row['Typical Amount']:,.0f}/month",value=checked,key=f"emi_select_{hashlib.sha1(key.encode()).hexdigest()[:12]}"):
+                    checked_indices.append(ridx)
+            if st.button("💾 Save selected EMI commitments",type="primary",key="save_emi_commitments"):
+                try:
+                    n=save_selected_emi_commitments(emi_rec,checked_indices)
+                    amount=selected_emi_amount(rec)
+                    st.success(f"Saved {n} mandatory EMI commitment(s). Monthly EMI commitment for Runway: ₹{amount:,.0f}.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Could not save EMI commitments: {e}")
+        else:
+            st.info("No monthly EMI candidates are currently detected. Correct your HDFC/NAVI/PNB lender transaction under Learning and set Class = EMI / Category = Loan EMI.")
+
+        saved_amount=selected_emi_amount(rec)
+        st.metric("📌 Saved monthly EMI commitments for Runway",f"₹{saved_amount:,.0f}")
+
+        st.markdown("### 🗑️ Remove recurring items")
+        st.caption("Removing a recurring item only excludes that detected pattern from the recurring list. It does not delete bank transactions.")
         options=rec.index.tolist()
         ridx=st.selectbox("Recurring payment to remove",options,format_func=lambda i:f"{rec.loc[i,'Merchant / Description']} | {rec.loc[i,'Frequency']} | ₹{rec.loc[i,'Typical Amount']:,.0f} | {rec.loc[i,'Type']}",key="recurring_remove_select")
         c1,c2=st.columns(2)
-        if c1.button("🗑️ Delete / exclude selected recurring payment",type="primary",key="delete_recurring"):
+        if c1.button("🗑️ Delete / exclude selected recurring payment",type="secondary",key="delete_recurring"):
             try:
-                exclude_recurring(rec.loc[ridx,"Recurring Key"])
+                key=rec.loc[ridx,"Recurring Key"]
+                # If it was a saved EMI, remove it from the mandatory list too.
+                if key in get_selected_emi_keys():
+                    remaining=get_selected_emi_keys()-{key}
+                    st.session_state["selected_emi_commitments"]=remaining
+                    try:
+                        save_selected_emi_commitments(rec, [i for i in rec.index if str(rec.loc[i,"Recurring Key"]) in remaining])
+                    except Exception:
+                        pass
+                exclude_recurring(key)
                 st.success("Recurring payment removed. Its bank transactions were not deleted and it is excluded from Runway.")
                 st.rerun()
             except Exception as e:
                 st.error(f"Could not remove recurring payment: {e}")
+
+        # Restore excluded patterns.
         excluded=get_recurring_exclusions()
-        # Show excluded commitments only when they can be rediscovered from current transactions.
-        all_detected=recurring(current_txns, apply_exclusions=False)
-        if all_detected is not None and not all_detected.empty:
-            excluded_df=all_detected[all_detected["Recurring Key"].isin(excluded)]
-        else:
-            excluded_df=pd.DataFrame()
+        all_detected=recurring(current_txns,apply_exclusions=False)
+        excluded_df=all_detected[all_detected["Recurring Key"].isin(excluded)] if not all_detected.empty else pd.DataFrame()
         if not excluded_df.empty:
-            st.markdown("#### ♻️ Excluded recurring payments")
+            st.markdown("### ♻️ Restore removed recurring payments")
             ex_opts=excluded_df.index.tolist()
-            ex_idx=st.selectbox("Recurring payment to restore",ex_opts,format_func=lambda i:f"{excluded_df.loc[i,'Merchant / Description']} | {excluded_df.loc[i,'Frequency']} | ₹{excluded_df.loc[i,'Typical Amount']:,.0f}",key="recurring_restore_select")
+            ex_idx=st.selectbox("Removed recurring payment",ex_opts,format_func=lambda i:f"{excluded_df.loc[i,'Merchant / Description']} | {excluded_df.loc[i,'Frequency']} | ₹{excluded_df.loc[i,'Typical Amount']:,.0f}",key="recurring_restore_select")
             if c2.button("↩️ Restore selected recurring payment",key="restore_recurring"):
-                restore_recurring(excluded_df.loc[ex_idx,"Recurring Key"])
-                st.success("Recurring payment restored and will be considered again.")
-                st.rerun()
-        st.info("Tip: classify HDFC/PNB loan transactions as Loan EMI / EMI under Learning so they are automatically detected as mandatory recurring commitments.")
+                try:
+                    restore_recurring(excluded_df.loc[ex_idx,"Recurring Key"])
+                    st.success("Recurring payment restored.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Could not restore recurring payment: {e}")
+
+        st.info("Tip: correct HDFC/NAVI/PNB loan transactions under Learning first. Once classified as EMI, they become selectable above even if only one month is available.")
 
 # Loans
 with tabs[4]:
@@ -1145,13 +1282,11 @@ with tabs[5]:
     df=get_txns(); ms=monthly_series(df)
     hist=float(ms.debit.tail(6).mean()) if not ms.empty else 0
     active_recurring=recurring(df) if not df.empty else pd.DataFrame()
-    recurring_emi=float(active_recurring[(active_recurring["Type"]=="EMI") & (active_recurring["Frequency"]=="Monthly")]["Typical Amount"].sum()) if not active_recurring.empty else 0.0
-    emi_hist=float(df[(df.direction=="Debit")&(df["class"]=="EMI")].groupby(df.txn_date.str[:7]).amount.sum().tail(6).mean()) if not df.empty else 0
-    default_emi=recurring_emi if recurring_emi>0 else max(0.0,emi_hist)
+    selected_emi_total=selected_emi_amount(active_recurring) if not active_recurring.empty else 0.0
     a,b,c,d=st.columns(4)
     liquid=a.number_input("Current liquid funds (₹)",min_value=0.0,value=0.0,step=10000.0)
-    essential=b.number_input("Monthly essential burn excluding EMI (₹)",min_value=0.0,value=max(0.0,hist-default_emi),step=5000.0)
-    emi_m=c.number_input("Monthly EMI commitment (₹) — from active recurring EMIs",min_value=0.0,value=float(default_emi),step=5000.0,help="Automatically calculated from active monthly EMI items in Recurring Payments. Remove non-mandatory recurring items there to exclude them from Runway.")
+    essential=b.number_input("Monthly essential burn excluding EMI (₹)",min_value=0.0,value=max(0.0,hist-selected_emi_total),step=5000.0)
+    emi_m=c.number_input("Monthly EMI commitment (₹) — saved selections",min_value=0.0,value=float(selected_emi_total),step=5000.0,disabled=True,help="Calculated from the EMI rows you explicitly selected and saved under Recurring Payments.")
     reduction=d.slider("Discretionary-spending reduction",0,100,35)
     e,f=st.columns(2)
     gap=e.number_input("Expected no-salary period (months)",min_value=0,max_value=60,value=6)
@@ -1211,8 +1346,18 @@ with tabs[6]:
     if df.empty: st.info("No transactions.")
     else:
         q=st.text_input("Search transactions")
+        category_choices=get_category_options(df)
+        selected_categories=st.multiselect("Filter expenses by category",category_choices,help="Select one or more categories to see the transaction rows and total spending for each selected category.")
         view=df.copy()
         if q: view=view[view.description.str.contains(q,case=False,na=False)]
+        if selected_categories:
+            view=view[(view.direction=="Debit") & (view.category.isin(selected_categories))]
+            summary=view.groupby("category",dropna=False).amount.sum().reset_index(name="Total spending")
+            st.markdown("### 📊 Selected category spending")
+            st.dataframe(summary.sort_values("Total spending",ascending=False),use_container_width=True,hide_index=True)
+            st.metric("Combined spending for selected categories",f"₹{float(view.amount.sum()):,.2f}")
+        else:
+            st.caption("Select one or more categories above to filter expense transactions and see category totals.")
         st.dataframe(view.sort_values("txn_date",ascending=False)[["id","txn_date","description","amount","direction","category","class","source"]],use_container_width=True,hide_index=True)
         if not view.empty:
             tid=st.selectbox("Select transaction to edit/delete",view.id.tolist())
@@ -1267,8 +1412,12 @@ with tabs[7]:
     confirm_reset = st.checkbox("I understand that this will permanently delete my saved financial data.", key="confirm_full_reset")
     if st.button("🧹 Reset all sample/test financial data", type="secondary", disabled=not confirm_reset):
         try:
-            reset_all_financial_data()
-            st.success("All sample/test financial data has been cleared. You can now import your real bank data.")
+            failures=reset_all_financial_data()
+            if failures:
+                detail="; ".join(f"{table}: {msg}" for table,msg in failures)
+                st.warning("Core financial data was reset, but one or more optional metadata tables could not be cleared. Run the supplied Supabase v7 migration/grant SQL and run Reset again. Details: " + detail)
+            else:
+                st.success("All sample/test financial data has been cleared. You can now import your real bank data.")
             st.rerun()
         except Exception as e:
-            st.error(f"Reset encountered an error: {e}. Please verify the data before trying again, because a cloud reset can be partially completed if one table rejects the delete.")
+            st.error(f"Reset could not be completed safely: {e}")

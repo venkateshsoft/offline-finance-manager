@@ -205,29 +205,38 @@ def restore_recurring(recurring_key):
             pass
 
 # ---------------- Explicit Runway EMI commitments ----------------
-def get_selected_emi_keys():
-    """Return recurring-payment keys explicitly selected as mandatory EMIs.
+def get_selected_emi_keys(force_reload=False):
+    """Return the exact set of recurring keys saved as mandatory Runway EMIs.
 
-    Session state keeps the feature usable even before the optional Supabase
-    migration is applied; when the table exists, selections persist across restarts.
+    The previous implementation *merged* database rows into session state. If an
+    old/stale row could not be deleted from Supabase, it silently came back on the
+    next Streamlit rerun and inflated the Runway EMI total. The selection is now
+    authoritative: load once per session, and every Save operation replaces the
+    persisted selection with exactly the checked rows.
     """
-    selected=st.session_state.setdefault("selected_emi_commitments", set())
+    if not force_reload and "selected_emi_commitments" in st.session_state:
+        return set(st.session_state["selected_emi_commitments"])
+
+    selected=set()
     if supabase_enabled():
         try:
             rows=(get_supabase().table("emi_commitments").select("recurring_key").execute().data or [])
-            selected.update(str(r["recurring_key"]) for r in rows if r.get("recurring_key"))
+            selected={str(r["recurring_key"]) for r in rows if r.get("recurring_key")}
         except Exception:
-            pass
+            # If the optional table is unavailable, start with no commitments rather
+            # than accidentally using an old/stale session value.
+            selected=set()
     else:
         try:
             rows=db_select("emi_commitments")
-            selected.update(str(r["recurring_key"]) for r in rows if r.get("recurring_key"))
+            selected={str(r["recurring_key"]) for r in rows if r.get("recurring_key")}
         except Exception:
-            pass
-    return selected
+            selected=set()
+    st.session_state["selected_emi_commitments"]=selected
+    return set(selected)
 
 def save_selected_emi_commitments(recurring_df, selected_indices):
-    """Persist exactly the checked recurring EMI rows as mandatory Runway commitments."""
+    """Persist EXACTLY the checked monthly EMI rows as mandatory Runway commitments."""
     keys=set()
     payload=[]
     for idx in selected_indices:
@@ -235,41 +244,50 @@ def save_selected_emi_commitments(recurring_df, selected_indices):
             continue
         r=recurring_df.loc[idx]
         key=str(r.get("Recurring Key", "")).strip()
-        if not key:
+        if not key or str(r.get("Frequency", "")) != "Monthly":
             continue
         keys.add(key)
         payload.append({
             "recurring_key":key,
             "merchant":str(r.get("Merchant / Description", "")),
-            "frequency":str(r.get("Frequency", "")),
+            "frequency":"Monthly",
             "amount":float(r.get("Typical Amount", 0) or 0),
             "created_at":datetime.now().isoformat(),
         })
 
-    st.session_state["selected_emi_commitments"]=keys
+    # Update session state immediately; this is the authoritative selection for
+    # the current Streamlit session and prevents stale database rows from being
+    # added back during reruns.
+    st.session_state["selected_emi_commitments"]=set(keys)
+
     if supabase_enabled():
+        client=get_supabase()
         try:
-            existing=(get_supabase().table("emi_commitments").select("id,recurring_key").execute().data or [])
-            existing_keys={str(r.get("recurring_key")):int(r["id"]) for r in existing if r.get("recurring_key")}
-            for row in payload:
-                if row["recurring_key"] in existing_keys:
-                    get_supabase().table("emi_commitments").update({k:v for k,v in row.items() if k!="created_at"}).eq("id",existing_keys[row["recurring_key"]]).execute()
-                else:
-                    get_supabase().table("emi_commitments").insert(row).execute()
-            for key,rid in existing_keys.items():
-                if key not in keys:
-                    get_supabase().table("emi_commitments").delete().eq("id",rid).execute()
-        except Exception:
-            pass
+            # Replace the whole commitment set atomically from the application's
+            # perspective: remove all existing saved commitments, then insert only
+            # the rows currently checked by the user. This prevents stale rows from
+            # previous selections from inflating the total.
+            client.table("emi_commitments").delete().neq("id", -1).execute()
+            if payload:
+                client.table("emi_commitments").insert(payload).execute()
+        except Exception as e:
+            # Do not silently hide persistence failures. The session selection is
+            # still correct, but the user must know if the cloud copy could not be
+            # replaced.
+            raise RuntimeError(
+                "The selected EMI list could not be saved to Supabase. "
+                "Please verify DELETE/INSERT permissions on public.emi_commitments. "
+                f"Details: {e}"
+            ) from e
     else:
-        try:
-            c=local_conn()
-            c.execute("DELETE FROM emi_commitments")
-            c.executemany("INSERT OR REPLACE INTO emi_commitments(recurring_key,merchant,frequency,amount,created_at) VALUES (?,?,?,?,?)",
-                          [(x["recurring_key"],x["merchant"],x["frequency"],x["amount"],x["created_at"]) for x in payload])
-            c.commit()
-        except Exception:
-            pass
+        c=local_conn()
+        c.execute("DELETE FROM emi_commitments")
+        if payload:
+            c.executemany(
+                "INSERT OR REPLACE INTO emi_commitments(recurring_key,merchant,frequency,amount,created_at) VALUES (?,?,?,?,?)",
+                [(x["recurring_key"],x["merchant"],x["frequency"],x["amount"],x["created_at"]) for x in payload]
+            )
+        c.commit()
     return len(keys)
 
 def selected_emi_amount(recurring_df):
@@ -1040,30 +1058,86 @@ with tabs[2]:
     st.caption("Corrections become local rules. Example: AMZN → Online Shopping, a lender name → Loan EMI.")
     df=get_txns()
     if not df.empty:
-        idx=st.selectbox("Transaction",df.index,format_func=lambda i:f"{df.loc[i,'txn_date']} | {df.loc[i,'description']} | ₹{df.loc[i,'amount']:,.2f} | {df.loc[i,'category']}")
-        r=df.loc[idx]
-        c1,c2,c3=st.columns(3)
-        category_options = get_category_options(df) + [CUSTOM_CATEGORY_OPTION]
-        current_category = str(r.category or "Other")
-        category_index = category_options.index(current_category) if current_category in category_options else category_options.index(CUSTOM_CATEGORY_OPTION)
-        cat_selection=c1.selectbox("Correct category",category_options,index=category_index, key="learning_category")
-        custom_cat = ""
-        if cat_selection == CUSTOM_CATEGORY_OPTION:
-            custom_cat = c1.text_input("Enter custom category", value=current_category if current_category not in CATEGORIES else "", key="learning_custom_category", placeholder="e.g. Investment")
-        classes=["Expense","EMI","Income","Transfer"]
-        cl=c2.selectbox("Correct class",classes,index=classes.index(r["class"]) if r["class"] in classes else 0, key="learning_class")
-        default=suggest_rule_pattern(r.description)
-        pattern=c3.text_input("Merchant pattern to learn",default, key="learning_pattern")
-        st.caption("Saving a correction updates the selected transaction and other transactions matching the same merchant pattern. Custom categories are retained for future corrections and imports.")
-        if st.button("Save correction & update similar transactions", type="primary"):
-            try:
-                cat = resolve_category(cat_selection, custom_cat)
-                status=save_rule(pattern,cat,cl)
-                updated_count = apply_learning_to_similar_transactions(pattern, cat, cl, int(r.id))
-                st.success(f"Learning rule saved. Updated {updated_count} similar transaction(s), including the selected transaction.")
-                st.rerun()
-            except Exception as e:
-                st.error(str(e))
+        # Search/filter first so users do not have to scroll through a large
+        # transaction dropdown. Amount search is exact to 2 decimal places,
+        # while description/merchant search is case-insensitive.
+        st.markdown("### 🔎 Find a transaction to correct")
+        s1, s2 = st.columns(2)
+        learning_search = s1.text_input(
+            "Search description / merchant",
+            placeholder="e.g. NAVI, PNBHOUSINGFIN, INDIAN CLEARING CORP",
+            key="learning_transaction_search"
+        )
+        learning_amount = s2.number_input(
+            "Search by exact amount (₹)",
+            min_value=0.0,
+            value=0.0,
+            step=100.0,
+            format="%.2f",
+            help="Enter 5000 to show transactions for exactly ₹5,000.00. Leave as 0 to ignore amount filtering.",
+            key="learning_transaction_amount"
+        )
+        f1, f2 = st.columns(2)
+        learning_category_filter = f1.multiselect(
+            "Current category",
+            sorted(df["category"].dropna().astype(str).unique().tolist()),
+            key="learning_current_category_filter"
+        )
+        learning_class_filter = f2.multiselect(
+            "Current class",
+            sorted(df["class"].dropna().astype(str).unique().tolist()),
+            key="learning_current_class_filter"
+        )
+
+        matches = df.copy()
+        if learning_search.strip():
+            needle = learning_search.strip()
+            matches = matches[matches["description"].astype(str).str.contains(needle, case=False, na=False, regex=False)]
+        if learning_amount > 0:
+            matches = matches[(matches["amount"].astype(float) - float(learning_amount)).abs() < 0.005]
+        if learning_category_filter:
+            matches = matches[matches["category"].astype(str).isin(learning_category_filter)]
+        if learning_class_filter:
+            matches = matches[matches["class"].astype(str).isin(learning_class_filter)]
+
+        st.caption(f"Found {len(matches):,} matching transaction(s). Refine the search if needed.")
+        if matches.empty:
+            st.warning("No transactions match the search criteria. Try a different amount or merchant/description.")
+            r = None
+        else:
+            # Keep the selection list limited to the filtered results.
+            # Sorting newest first makes recent bank entries easier to find.
+            matches = matches.sort_values(["txn_date", "id"], ascending=[False, False])
+            idx=st.selectbox(
+                "Select transaction to correct",
+                matches.index.tolist(),
+                format_func=lambda i:f"{matches.loc[i,'txn_date']} | {matches.loc[i,'description']} | ₹{matches.loc[i,'amount']:,.2f} | {matches.loc[i,'category']} | {matches.loc[i,'class']}",
+                key="learning_transaction_select"
+            )
+            r=matches.loc[idx]
+        if r is not None:
+            c1,c2,c3=st.columns(3)
+            category_options = get_category_options(df) + [CUSTOM_CATEGORY_OPTION]
+            current_category = str(r.category or "Other")
+            category_index = category_options.index(current_category) if current_category in category_options else category_options.index(CUSTOM_CATEGORY_OPTION)
+            cat_selection=c1.selectbox("Correct category",category_options,index=category_index, key="learning_category")
+            custom_cat = ""
+            if cat_selection == CUSTOM_CATEGORY_OPTION:
+                custom_cat = c1.text_input("Enter custom category", value=current_category if current_category not in CATEGORIES else "", key="learning_custom_category", placeholder="e.g. Investment")
+            classes=["Expense","EMI","Income","Transfer"]
+            cl=c2.selectbox("Correct class",classes,index=classes.index(r["class"]) if r["class"] in classes else 0, key="learning_class")
+            default=suggest_rule_pattern(r.description)
+            pattern=c3.text_input("Merchant pattern to learn",default, key="learning_pattern")
+            st.caption("Saving a correction updates the selected transaction and other transactions matching the same merchant pattern. Custom categories are retained for future corrections and imports.")
+            if st.button("Save correction & update similar transactions", type="primary"):
+                try:
+                    cat = resolve_category(cat_selection, custom_cat)
+                    status=save_rule(pattern,cat,cl)
+                    updated_count = apply_learning_to_similar_transactions(pattern, cat, cl, int(r.id))
+                    st.success(f"Learning rule saved. Updated {updated_count} similar transaction(s), including the selected transaction.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
     rules=load_rules()
     if rules:
         st.dataframe(pd.DataFrame(rules,columns=["Pattern","Category","Class"]),use_container_width=True,hide_index=True)
@@ -1103,7 +1177,7 @@ with tabs[3]:
             if st.button("💾 Save selected EMI commitments",type="primary",key="save_emi_commitments"):
                 try:
                     n=save_selected_emi_commitments(emi_rec,checked_indices)
-                    amount=selected_emi_amount(rec)
+                    amount=selected_emi_amount(emi_rec)
                     st.success(f"Saved {n} mandatory EMI commitment(s). Monthly EMI commitment for Runway: ₹{amount:,.0f}.")
                     st.rerun()
                 except Exception as e:

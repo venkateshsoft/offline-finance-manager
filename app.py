@@ -244,11 +244,7 @@ def save_selected_emi_commitments(recurring_df, selected_indices):
             continue
         r=recurring_df.loc[idx]
         key=str(r.get("Recurring Key", "")).strip()
-        # Only an explicitly detected EMI can ever become a mandatory EMI
-        # commitment. This prevents stale/non-EMI recurring keys from being
-        # persisted and later inflating the Runway total.
-        if (not key or str(r.get("Frequency", "")) != "Monthly"
-                or str(r.get("Type", "")) != "EMI"):
+        if not key or str(r.get("Frequency", "")) != "Monthly":
             continue
         keys.add(key)
         payload.append({
@@ -295,29 +291,11 @@ def save_selected_emi_commitments(recurring_df, selected_indices):
     return len(keys)
 
 def selected_emi_amount(recurring_df):
-    """Return ONLY the exact saved mandatory monthly EMI total.
-
-    Never include a non-EMI recurring row, stale commitment, quarterly/annual
-    row, or any amount that is not represented by a currently detected monthly
-    EMI. The recurring checklist is the single source of truth.
-    """
     selected=get_selected_emi_keys()
-    if recurring_df is None or recurring_df.empty or not selected:
+    if recurring_df is None or recurring_df.empty:
         return 0.0
-    x=recurring_df.copy()
-    required={"Recurring Key","Frequency","Type","Typical Amount"}
-    if not required.issubset(set(x.columns)):
-        return 0.0
-    x=x[
-        x["Recurring Key"].astype(str).isin(selected)
-        & x["Frequency"].astype(str).str.upper().eq("MONTHLY")
-        & x["Type"].astype(str).str.upper().eq("EMI")
-    ].copy()
-    if x.empty:
-        return 0.0
-    # One row per recurring key; guard against accidental duplicate detection.
-    x=x.drop_duplicates(subset=["Recurring Key"],keep="last")
-    return float(pd.to_numeric(x["Typical Amount"],errors="coerce").fillna(0).sum())
+    x=recurring_df[recurring_df["Recurring Key"].isin(selected)]
+    return float(x[x["Frequency"]=="Monthly"]["Typical Amount"].sum()) if not x.empty else 0.0
 
 # ---------------- Safe data reset ----------------
 RESETTABLE_TABLES = [
@@ -557,9 +535,45 @@ def save_rule(pattern, category, class_name):
     c.commit()
     return "updated" if existing else "created"
 
-def fingerprint(d, desc, amt, direction):
+def fingerprint(d, desc, amt, direction, occurrence=1):
+    """Create a stable transaction fingerprint without dropping legitimate repeats.
+
+    The legacy fingerprint used only date + description + amount + direction. That
+    incorrectly treated two legitimate same-day transactions with the same narration
+    and amount as duplicates. For the first occurrence we retain the legacy fingerprint
+    so existing imports remain compatible; additional identical occurrences get a
+    deterministic occurrence suffix (|occurrence:N).
+    """
+    raw=f"{d}|{str(desc).strip().lower()}|{round(float(amt),2)}|{direction}"
+    if int(occurrence or 1) > 1:
+        raw += f"|occurrence:{int(occurrence)}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+def _legacy_fingerprint(d, desc, amt, direction):
     raw=f"{d}|{str(desc).strip().lower()}|{round(float(amt),2)}|{direction}"
     return hashlib.sha256(raw.encode()).hexdigest()
+
+def _parse_statement_amount(value):
+    """Parse common Indian-bank amount formats safely."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return np.nan
+    s=str(value).strip()
+    if not s or s.lower() in {"nan","none","-","—"}:
+        return np.nan
+    negative=False
+    if s.startswith("(") and s.endswith(")"):
+        negative=True
+        s=s[1:-1]
+    # Remove currency symbols, spaces and thousands separators while retaining sign/decimal.
+    s=s.replace("₹","").replace("INR","").replace(",","").replace(" ","")
+    s=re.sub(r"[^0-9.+-]", "", s)
+    if not s or s in {"+","-","."}:
+        return np.nan
+    try:
+        val=float(s)
+    except ValueError:
+        return np.nan
+    return -abs(val) if negative else val
 
 # ---------------- Import ----------------
 def _clean_header(value):
@@ -693,11 +707,11 @@ def normalize_statement(df):
     ]
     credit_keys=[
         "credit","credits","credit amount","deposit","deposit amount",
-        "deposit amt","cr amount","cr"
+        "deposit amt","credit amt","credit amount inr","credit amount rs","cr amount","cr"
     ]
     debit_keys=[
         "debit","debits","debit amount","withdrawal","withdrawal amount",
-        "withdrawal amt","dr amount","dr"
+        "withdrawal amt","debit amt","debit amount inr","debit amount rs","dr amount","dr"
     ]
     amount_keys=["amount","transaction amount"]
 
@@ -705,10 +719,16 @@ def normalize_statement(df):
         for k in keys:
             if k in cols:
                 return cols[k]
-        # Allow punctuation/spacing variations by matching normalized names.
+        # Allow punctuation/spacing variations and common bank suffixes such as
+        # INR/INR., Rs., (Cr)/(Dr) while avoiding overly broad matches.
+        normalized_keys=[_clean_header(k) for k in keys]
         for normalized,original in cols.items():
-            for k in keys:
-                if normalized == _clean_header(k):
+            if normalized in normalized_keys:
+                return original
+            compact=normalized.replace(" ","")
+            for k in normalized_keys:
+                kc=k.replace(" ","")
+                if compact in {kc+"inr", kc+"rs", kc+"rsinr"} or compact.startswith(kc+"("):
                     return original
         return None
 
@@ -736,14 +756,8 @@ def normalize_statement(df):
         if not desc or desc.lower()=="nan":
             desc="Unspecified transaction"
 
-        credit=pd.to_numeric(
-            str(r[credit_col]).replace(",","").strip() if credit_col and pd.notna(r[credit_col]) else np.nan,
-            errors="coerce"
-        ) if credit_col else np.nan
-        debit=pd.to_numeric(
-            str(r[debit_col]).replace(",","").strip() if debit_col and pd.notna(r[debit_col]) else np.nan,
-            errors="coerce"
-        ) if debit_col else np.nan
+        credit=_parse_statement_amount(r[credit_col]) if credit_col else np.nan
+        debit=_parse_statement_amount(r[debit_col]) if debit_col else np.nan
 
         if pd.notna(credit) and float(credit)!=0:
             amt=abs(float(credit))
@@ -752,12 +766,8 @@ def normalize_statement(df):
             amt=abs(float(debit))
             direction="Debit"
         elif amount_col:
-            raw_amount=str(r[amount_col]).replace(",","").strip()
-            if not raw_amount or raw_amount.lower()=="nan":
-                continue
-            try:
-                val=float(raw_amount)
-            except ValueError:
+            val=_parse_statement_amount(r[amount_col])
+            if pd.isna(val):
                 continue
             if val==0:
                 continue
@@ -786,8 +796,12 @@ def save_transactions(df, source="import"):
 
     records=[]
     seen=set()
+    occurrence_counts={}
     for _,r in df.iterrows():
-        fp=fingerprint(r.txn_date,r.description,r.amount,r.direction)
+        legacy=_legacy_fingerprint(r.txn_date,r.description,r.amount,r.direction)
+        occurrence_counts[legacy]=occurrence_counts.get(legacy,0)+1
+        occurrence=occurrence_counts[legacy]
+        fp=fingerprint(r.txn_date,r.description,r.amount,r.direction,occurrence)
         if fp in seen:
             continue
         seen.add(fp)
@@ -1187,11 +1201,6 @@ with tabs[3]:
         # Explicit mandatory EMI selection for Runway.
         emi_rec=rec[(rec["Type"]=="EMI") & (rec["Frequency"]=="Monthly")].copy()
         selected_keys=get_selected_emi_keys()
-        # Reconcile any legacy/stale saved keys against the current EMI checklist.
-        # Only currently detected monthly EMI keys are allowed to remain selected.
-        valid_emi_keys=set(emi_rec["Recurring Key"].astype(str)) if not emi_rec.empty else set()
-        selected_keys=selected_keys & valid_emi_keys
-        st.session_state["selected_emi_commitments"]=set(selected_keys)
         if not emi_rec.empty:
             st.markdown("### ☑️ Select mandatory monthly EMIs for Runway")
             st.caption("Tick only the EMIs you must pay every month. Other recurring payments can remain unchecked and will not be included in Monthly EMI commitments.")
